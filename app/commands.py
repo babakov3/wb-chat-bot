@@ -243,7 +243,7 @@ def register_all(
 
     # ── Text input router ────────────────────────────────────────
 
-    async def on_text_input(chat_id: str, text: str) -> None:
+    async def on_text_input(chat_id: str, text: str, message_id: int) -> None:
         """Route text input based on input_waiting prefix."""
         user_state = storage.get_user_state(chat_id)
         if not user_state:
@@ -251,7 +251,7 @@ def register_all(
         waiting = user_state.get("input_waiting") or ""
 
         if waiting.startswith("ob:"):
-            await onboarding.handle_text(chat_id, text)
+            await onboarding.handle_text(chat_id, text, message_id)
         elif waiting.startswith("s:"):
             await settings_ui.handle_text_input(chat_id, text)
 

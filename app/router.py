@@ -15,7 +15,7 @@ logger = logging.getLogger("wb_chat_bot")
 CommandHandler = Callable[[str], Coroutine[Any, Any, None]]
 ButtonHandler = Callable[[str], Coroutine[Any, Any, None]]
 CallbackHandler = Callable[[str, str, int], Coroutine[Any, Any, None]]
-TextInputHandler = Callable[[str, str], Coroutine[Any, Any, None]]
+TextInputHandler = Callable[[str, str, int], Coroutine[Any, Any, None]]
 
 
 class MessageRouter:
@@ -95,8 +95,9 @@ class MessageRouter:
         user_state = self._storage.get_user_state(chat_id)
         if user_state and user_state.get("input_waiting"):
             if self._text_input_handler:
+                user_msg_id = msg.get("message_id", 0)
                 try:
-                    await self._text_input_handler(chat_id, text)
+                    await self._text_input_handler(chat_id, text, user_msg_id)
                 except Exception as exc:
                     logger.error("Text input handler error: %s", exc, exc_info=True)
             return

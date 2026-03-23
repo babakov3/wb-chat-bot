@@ -8,6 +8,9 @@ Steps:
 
 State is stored in user_state: onboarding_step + onboarding_data (JSON).
 Callback prefix: ob:
+
+A single bot message is sent at the start and edited throughout the wizard.
+The message_id is persisted in onboarding_data["msg_id"].
 """
 
 from __future__ import annotations
@@ -64,12 +67,48 @@ class OnboardingWizard:
             input_waiting=None,
         )
 
+    def _get_msg_id(self, chat_id: str) -> int | None:
+        data = self._get_data(chat_id)
+        return data.get("msg_id")
+
+    async def _edit(
+        self,
+        chat_id: str,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        """Edit the single onboarding message.  Falls back to send if missing."""
+        msg_id = self._get_msg_id(chat_id)
+        if msg_id:
+            await self._tg.edit_message_text(
+                chat_id, msg_id, text, reply_markup=reply_markup
+            )
+        else:
+            # Fallback: send a new message and persist its id
+            new_id = await self._tg.send_message(
+                chat_id, text, reply_markup=reply_markup
+            )
+            if new_id:
+                data = self._get_data(chat_id)
+                data["msg_id"] = new_id
+                self._save_data(chat_id, data)
+
     # ── Entry point ──────────────────────────────────────────────
 
     async def start(self, chat_id: str) -> None:
-        """Begin onboarding from step 1."""
-        self._save_data(chat_id, {})
-        await self._step_1_name(chat_id)
+        """Begin onboarding from step 1. Send the initial message."""
+        self._set_step(chat_id, "1")
+        self._storage.set_user_state(chat_id, input_waiting="ob:name")
+
+        text = (
+            "<b>Шаг 1/4 — Название магазина</b>\n\n"
+            "Введите название вашего магазина на Wildberries.\n"
+            "Это имя будет отображаться в боте для удобства."
+        )
+        markup = _kb([[("Отмена", "ob:cancel")]])
+        new_id = await self._tg.send_message(chat_id, text, reply_markup=markup)
+        # Persist the message id for future edits
+        self._save_data(chat_id, {"msg_id": new_id})
 
     # ── Step 1: Store name ───────────────────────────────────────
 
@@ -82,7 +121,7 @@ class OnboardingWizard:
             "Это имя будет отображаться в боте для удобства."
         )
         markup = _kb([[("Отмена", "ob:cancel")]])
-        await self._tg.send_message(chat_id, text, reply_markup=markup)
+        await self._edit(chat_id, text, reply_markup=markup)
 
     # ── Step 2: API token ────────────────────────────────────────
 
@@ -100,7 +139,7 @@ class OnboardingWizard:
             "Получить токен: seller.wildberries.ru → Настройки → Доступ к API"
         )
         markup = _kb([[("Назад", "ob:back:1")], [("Отмена", "ob:cancel")]])
-        await self._tg.send_message(chat_id, text, reply_markup=markup)
+        await self._edit(chat_id, text, reply_markup=markup)
 
     # ── Step 3: Message ──────────────────────────────────────────
 
@@ -118,7 +157,7 @@ class OnboardingWizard:
             rows.append([(tpl["name"], f"ob:tpl:{i}")])
         rows.append([("Написать своё", "ob:msg:custom")])
         rows.append([("Назад", "ob:back:2")])
-        await self._tg.send_message(chat_id, text, reply_markup=_kb(rows))
+        await self._edit(chat_id, text, reply_markup=_kb(rows))
 
     async def _show_template_preview(self, chat_id: str, idx: int) -> None:
         """Show full template text with Use / Back buttons."""
@@ -140,7 +179,7 @@ class OnboardingWizard:
             [("Использовать", "ob:tpl:use")],
             [("Назад к шаблонам", "ob:back:3")],
         ])
-        await self._tg.send_message(chat_id, text, reply_markup=markup)
+        await self._edit(chat_id, text, reply_markup=markup)
 
     async def _ask_contact(self, chat_id: str) -> None:
         """Ask user for their contact (for {contact} placeholder)."""
@@ -154,7 +193,7 @@ class OnboardingWizard:
             "Например: <code>@my_support</code> или ссылку на TG/WhatsApp"
         )
         markup = _kb([[("Назад к шаблонам", "ob:back:3")]])
-        await self._tg.send_message(chat_id, text, reply_markup=markup)
+        await self._edit(chat_id, text, reply_markup=markup)
 
     async def _prompt_custom_message(self, chat_id: str) -> None:
         """Ask user to type their own message."""
@@ -167,17 +206,13 @@ class OnboardingWizard:
             "Вы можете использовать переносы строк."
         )
         markup = _kb([[("Назад к шаблонам", "ob:back:3")]])
-        await self._tg.send_message(chat_id, text, reply_markup=markup)
+        await self._edit(chat_id, text, reply_markup=markup)
 
     # ── Step 4: Products ─────────────────────────────────────────
 
     async def _step_4_products(self, chat_id: str) -> None:
         self._set_step(chat_id, "4")
         self._storage.set_user_state(chat_id, input_waiting=None)
-
-        # Try to load products from WB Content API
-        data = self._get_data(chat_id)
-        api_token = data.get("api_token", "")
 
         text = (
             "<b>Шаг 4/4 — Товары</b>\n\n"
@@ -188,7 +223,7 @@ class OnboardingWizard:
             [("Выбрать из каталога", "ob:prod:pick")],
             [("Назад", "ob:back:3")],
         ])
-        await self._tg.send_message(chat_id, text, reply_markup=markup)
+        await self._edit(chat_id, text, reply_markup=markup)
 
     async def _load_and_show_products(self, chat_id: str, page: int = 0) -> None:
         """Load products from WB and show picker."""
@@ -197,8 +232,8 @@ class OnboardingWizard:
         products = data.get("products", [])
 
         if not products:
-            # Try loading from WB
-            await self._tg.send_message(chat_id, "Загружаю каталог товаров из WB...")
+            # Show loading state in the main message
+            await self._edit(chat_id, "Загружаю каталог товаров из WB...")
             try:
                 wb = WBClient(api_token)
                 try:
@@ -221,7 +256,7 @@ class OnboardingWizard:
                 "Пока будем отслеживать все товары."
             )
             markup = _kb([[("Продолжить (все товары)", "ob:prod:all")]])
-            await self._tg.send_message(chat_id, text, reply_markup=markup)
+            await self._edit(chat_id, text, reply_markup=markup)
             return
 
         selected = set(data.get("selected_products", []))
@@ -267,7 +302,7 @@ class OnboardingWizard:
             f"Выбрано: {selected_count}\n\n"
             "Нажмите на товар чтобы добавить/убрать:"
         )
-        await self._tg.send_message(chat_id, text, reply_markup=_kb(rows))
+        await self._edit(chat_id, text, reply_markup=_kb(rows))
 
     # ── Done ─────────────────────────────────────────────────────
 
@@ -280,6 +315,7 @@ class OnboardingWizard:
         message_text = data.get("message_text", "")
         selected = data.get("selected_products", [])
         products = data.get("products", [])
+        msg_id = data.get("msg_id")
 
         # Build whitelist string
         wl_str = ",".join(str(nm) for nm in sorted(selected)) if selected else ""
@@ -327,7 +363,14 @@ class OnboardingWizard:
             "Для запуска → ⚙️ Настройки → переключить на БОЕВОЙ"
         )
         from app.commands import _build_keyboard
-        await self._tg.send_message(chat_id, text, reply_markup=_build_keyboard(None))
+        markup = _build_keyboard(None)
+        # Edit the main onboarding message with the final summary
+        if msg_id:
+            await self._tg.edit_message_text(
+                chat_id, msg_id, text, reply_markup=markup
+            )
+        else:
+            await self._tg.send_message(chat_id, text, reply_markup=markup)
 
     # ── Callback handler ─────────────────────────────────────────
 
@@ -339,8 +382,9 @@ class OnboardingWizard:
         if data == "ob:cancel":
             self._clear(chat_id)
             from app.commands import _build_keyboard
-            await self._tg.send_message(
-                chat_id, "Настройка отменена.", reply_markup=_build_keyboard(None)
+            await self._tg.edit_message_text(
+                chat_id, message_id, "Настройка отменена.",
+                reply_markup=_build_keyboard(None),
             )
             return
 
@@ -426,8 +470,12 @@ class OnboardingWizard:
 
     # ── Text input handler ───────────────────────────────────────
 
-    async def handle_text(self, chat_id: str, text: str) -> None:
-        """Handle free-text input during onboarding."""
+    async def handle_text(self, chat_id: str, text: str, user_msg_id: int = 0) -> None:
+        """Handle free-text input during onboarding.
+
+        user_msg_id is the id of the user's text message so we can delete it
+        to keep the chat clean.
+        """
         user_state = self._storage.get_user_state(chat_id)
         if not user_state:
             return
@@ -438,6 +486,10 @@ class OnboardingWizard:
         self._storage.set_user_state(chat_id, input_waiting=None)
         data = self._get_data(chat_id)
 
+        # Delete the user's text message to keep the chat tidy
+        if user_msg_id:
+            await self._tg.delete_message(chat_id, user_msg_id)
+
         if waiting == "ob:name":
             # Step 1: store name entered
             data["store_name"] = text.strip()
@@ -447,7 +499,7 @@ class OnboardingWizard:
         elif waiting == "ob:token":
             # Step 2: API token entered — validate
             token = text.strip()
-            await self._tg.send_message(chat_id, "Проверяю токен...")
+            await self._edit(chat_id, "Проверяю токен...")
             wb = WBClient(token)
             try:
                 valid = await wb.check_token()
@@ -459,11 +511,11 @@ class OnboardingWizard:
             if valid:
                 data["api_token"] = token
                 self._save_data(chat_id, data)
-                await self._tg.send_message(chat_id, "Токен валиден!")
+                await self._edit(chat_id, "Токен валиден!")
                 await self._step_3_message(chat_id)
             else:
                 self._storage.set_user_state(chat_id, input_waiting="ob:token")
-                await self._tg.send_message(
+                await self._edit(
                     chat_id,
                     "Токен невалиден или не имеет прав на чаты.\n"
                     "Проверьте токен и отправьте ещё раз."
@@ -477,15 +529,10 @@ class OnboardingWizard:
                 final = tpl["text"].replace("{contact}", text.strip())
                 data["message_text"] = final
                 self._save_data(chat_id, data)
-                await self._tg.send_message(
-                    chat_id,
-                    f"Шаблон «{tpl['name']}» применён с контактом: {text.strip()}"
-                )
             await self._step_4_products(chat_id)
 
         elif waiting == "ob:msg":
             # Step 3: custom message entered
             data["message_text"] = text
             self._save_data(chat_id, data)
-            await self._tg.send_message(chat_id, "Сообщение сохранено.")
             await self._step_4_products(chat_id)
