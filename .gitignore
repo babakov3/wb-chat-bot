@@ -2,7 +2,11 @@ venv/
 __pycache__/
 *.pyc
 .env
-data/app.db
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db.backup
+data/app.db*
 logs/*.log
 /tmp/
 .DS_Store

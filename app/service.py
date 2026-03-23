@@ -32,6 +32,12 @@ class ChatService:
         self._running: bool = False
         self._poll_count: int = 0
         self._last_heartbeat: datetime = datetime.now(timezone.utc)
+        self._store_semaphores: dict[int, asyncio.Semaphore] = {}
+
+    def _get_semaphore(self, store_id: int) -> asyncio.Semaphore:
+        if store_id not in self._store_semaphores:
+            self._store_semaphores[store_id] = asyncio.Semaphore(3)
+        return self._store_semaphores[store_id]
 
     async def run(self) -> None:
         """Main loop: run Telegram polling and WB polling in parallel."""
@@ -129,17 +135,33 @@ class ChatService:
         if events:
             logger.debug("Store %d: %d events", store_id, len(events))
 
-        # Process new chat events
+        # Process new chat events with atomic reservation
+        sem = self._get_semaphore(store_id)
         new_chat_tasks = []
         for event in events:
             if self._is_new_chat_event(event):
                 wb_chat_id = self._extract_chat_id(event)
-                if wb_chat_id and not self.storage.is_chat_processed(wb_chat_id, store_id):
-                    if not self._passes_filters(event, wb_chat_id, store):
-                        continue
-                    new_chat_tasks.append(
-                        self._handle_new_chat(event, wb_chat_id, store, wb)
-                    )
+                if not wb_chat_id:
+                    continue
+                if not self._passes_filters(event, wb_chat_id, store):
+                    continue
+                # Atomic reservation — prevents race conditions
+                event_id = self._extract_event_id(event)
+                reply_sign = self._extract_reply_sign(event)
+                nm_id = self._extract_nm_id(event)
+                reserved = self.storage.reserve_chat(
+                    wb_chat_id, store_id,
+                    first_event_id=event_id, reply_sign=reply_sign, nm_id=nm_id,
+                    product_name=self._extract_product_name(event),
+                    client_name=self._extract_client_name(event),
+                    client_message=self._extract_client_message(event),
+                    rating=self._extract_rating(event),
+                )
+                if not reserved:
+                    continue  # already being processed or done
+                new_chat_tasks.append(
+                    self._handle_reserved_chat(event, wb_chat_id, store, wb, sem)
+                )
 
         if new_chat_tasks:
             await asyncio.gather(*new_chat_tasks, return_exceptions=True)
@@ -309,11 +331,20 @@ class ChatService:
 
     # ── New chat handling ───────────────────────────────────────────────
 
-    async def _handle_new_chat(
+    async def _handle_reserved_chat(
+        self, event: dict[str, Any], wb_chat_id: str,
+        store: dict[str, Any], wb: WBClient,
+        sem: asyncio.Semaphore,
+    ) -> None:
+        """Process a reserved chat with semaphore limiting."""
+        async with sem:
+            await self._process_chat(event, wb_chat_id, store, wb)
+
+    async def _process_chat(
         self, event: dict[str, Any], wb_chat_id: str,
         store: dict[str, Any], wb: WBClient,
     ) -> None:
-        """Process a single new chat for a store."""
+        """Process a single new chat for a store (already reserved in DB)."""
         store_id = store["id"]
         user_chat_id = store["user_chat_id"]
 
@@ -325,7 +356,6 @@ class ChatService:
         client_message = self._extract_client_message(event)
         product_name = self._extract_product_name(event)
 
-        # Try to get product name from store_products if not in event
         if not product_name and nm_id:
             product_name = self.storage.get_store_product_name(store_id, nm_id)
 
@@ -345,13 +375,8 @@ class ChatService:
             store_id, wb_chat_id, client_name, nm_id, rating, complaint_category,
         )
 
-        # Apply delay
+        # Apply delay (chat already reserved — no race condition)
         await asyncio.sleep(self.config.new_chat_delay_seconds)
-
-        # Double-check dedup
-        if self.storage.is_chat_processed(wb_chat_id, store_id):
-            logger.info("Chat %s (store %d) already processed during delay", wb_chat_id, store_id)
-            return
 
         is_dry_run = store["app_mode"] != "production"
         message_text = store["message_text"]
@@ -366,9 +391,9 @@ class ChatService:
                 sent_message_text=message_text,
                 **extra,
             )
-            name = extra.get("client_name") or "?"
-            cat = extra.get("complaint_category") or ""
-            nm = extra.get("nm_id") or ""
+            name = client_name or "?"
+            cat = complaint_category or ""
+            nm = nm_id or ""
             await self.telegram.notify(
                 user_chat_id,
                 f"[{store['store_name']}] <b>[ТЕСТ] Новый негатив</b>\n"

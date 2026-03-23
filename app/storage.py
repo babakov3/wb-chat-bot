@@ -294,6 +294,26 @@ class Storage:
         ).fetchone()
         return row is not None
 
+    def reserve_chat(self, chat_id: str, store_id: int, **kwargs: Any) -> bool:
+        """Atomically reserve a chat for processing. Returns True if reserved, False if already exists."""
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._conn:
+                self._conn.execute(
+                    """INSERT INTO processed_chats
+                        (store_id, chat_id, first_event_id, reply_sign, status, processed_at,
+                         nm_id, product_name, client_name, client_message, rating)
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+                    (store_id, chat_id, kwargs.get("first_event_id"),
+                     kwargs.get("reply_sign"), now,
+                     kwargs.get("nm_id"), kwargs.get("product_name"),
+                     kwargs.get("client_name"), kwargs.get("client_message"),
+                     kwargs.get("rating")),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
     def save_chat(
         self,
         chat_id: str,
@@ -340,6 +360,15 @@ class Storage:
                  nm_id, product_name, client_name, client_message,
                  complaint_category, rating),
             )
+
+    def get_last_error(self, store_id: int) -> str | None:
+        """Get last error text for a store, or None."""
+        row = self._conn.execute(
+            "SELECT error_text FROM processed_chats WHERE store_id = ? AND error_text IS NOT NULL "
+            "ORDER BY processed_at DESC LIMIT 1",
+            (store_id,),
+        ).fetchone()
+        return row["error_text"] if row else None
 
     # ── Analytics ────────────────────────────────────────────────
 

@@ -256,11 +256,11 @@ class WBClient:
                 for card in cards:
                     nm_id = card.get("nmID")
                     # Title can be in different fields depending on API version
-                    name = (
-                        card.get("title")
-                        or card.get("subjectName", "")
-                        + " " + card.get("vendorCode", "")
-                    ).strip()
+                    name = card.get("title") or ""
+                    if not name:
+                        subject = card.get("subjectName", "")
+                        vendor = card.get("vendorCode", "")
+                        name = f"{subject} {vendor}".strip()
                     if not name:
                         name = str(nm_id)
                     if nm_id:

@@ -108,10 +108,36 @@ def register_all(
         else:
             prod_label = f"все ({total_products})"
 
+        # Token health
+        token_ok = bool(store.get("wb_api_token"))
+        token_label = "✅ Токен: активен" if token_ok else "❌ Токен: не задан"
+
+        # Active/paused
+        active_label = "▶️ Работает" if store["is_active"] else "⏸ На паузе"
+
+        # Last processed
+        last = storage.get_last_chats(store["id"], 1)
+        if last:
+            last_row = last[0]
+            last_label = f"📅 Посл. обработка: {last_row['processed_at'][:16].replace('T', ' ')}"
+        else:
+            last_label = "📅 Посл. обработка: ещё не было"
+
+        # Last error
+        last_err = storage.get_last_error(store["id"])
+        if last_err:
+            err_label = f"⚠️ Посл. ошибка: {last_err[:50]}"
+        else:
+            err_label = "✅ Ошибок нет"
+
         text = (
             f"{mode_icon} <b>{store['store_name']}</b> — {mode_label}\n\n"
+            f"{active_label}\n"
+            f"{token_label}\n"
             f"📦 Товаров: <b>{prod_label}</b>\n"
-            f"📨 Обработано: <b>{stats.get('total', 0)}</b>"
+            f"📨 Обработано: <b>{stats.get('total', 0)}</b>\n"
+            f"{last_label}\n"
+            f"{err_label}"
         )
         await telegram.send_message(chat_id, text, reply_markup=_build_keyboard(store))
 
