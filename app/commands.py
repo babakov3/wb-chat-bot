@@ -215,9 +215,8 @@ def register_all(
             marker = "▸ " if is_current else "  "
             mode = "ТЕСТ" if s["app_mode"] == "dry-run" else "БОЕВОЙ"
             state_icon = "✅" if s["is_active"] else "⏸"
-            current_label = " ← активный" if is_current else ""
             lines.append(
-                f"{marker}{state_icon} <b>{s['store_name']}</b> [{mode}]{current_label}"
+                f"{marker}{state_icon} <b>{s['store_name']}</b> [{mode}]"
             )
 
         rows: list[list[tuple[str, str]]] = []
