@@ -158,11 +158,7 @@ class ChatService:
             "Store %d: cursor initialized to NOW (%d). Only future events will be processed.",
             store_id, ts,
         )
-        await self.telegram.notify(
-            store["user_chat_id"],
-            f"[{store['store_name']}] Cursor инициализирован. "
-            "Бот будет обрабатывать только новые чаты с этого момента.",
-        )
+        # No user-facing message — the onboarding completion message is enough
 
     # ── Event field extraction ──────────────────────────────────────────
 
