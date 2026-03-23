@@ -94,8 +94,10 @@ class OnboardingWizard:
         text = (
             f"<b>Шаг 2/4 — API токен</b>\n"
             f"Магазин: <b>{store_name}</b>\n\n"
-            "Вставьте API-токен Wildberries с правами на <b>Чат с покупателями</b>.\n\n"
-            "Получить токен: seller.wildberries.ru -> Настройки -> Доступ к API"
+            "Вставьте API-токен Wildberries с правами:\n"
+            "• <b>Чат с покупателями</b>\n"
+            "• <b>Контент</b>\n\n"
+            "Получить токен: seller.wildberries.ru → Настройки → Доступ к API"
         )
         markup = _kb([[("Назад", "ob:back:1")], [("Отмена", "ob:cancel")]])
         await self._tg.send_message(chat_id, text, reply_markup=markup)

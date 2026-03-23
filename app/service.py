@@ -34,19 +34,30 @@ class ChatService:
         self._last_heartbeat: datetime = datetime.now(timezone.utc)
 
     async def run(self) -> None:
-        """Main loop: poll Telegram updates + WB events for all active stores."""
+        """Main loop: run Telegram polling and WB polling in parallel."""
         self._running = True
         logger.info("Service starting (multi-store mode)")
+        await asyncio.gather(
+            self._telegram_loop(),
+            self._wb_loop(),
+        )
 
+    async def _telegram_loop(self) -> None:
+        """Fast loop for Telegram updates — 1 second interval for snappy UI."""
         while self._running:
             try:
-                # 1. Poll Telegram updates (all users)
                 await self.telegram.poll_updates()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Telegram poll error: %s", exc)
+            await asyncio.sleep(1)
 
-                # 2. Heartbeat
+    async def _wb_loop(self) -> None:
+        """WB events polling loop — separate from Telegram for speed."""
+        while self._running:
+            try:
                 await self._heartbeat()
-
-                # 3. Iterate all active stores and poll WB events
                 active_stores = self.storage.get_all_active_stores()
                 for store in active_stores:
                     try:
@@ -57,12 +68,10 @@ class ChatService:
                             store["id"], store["store_name"], exc,
                             exc_info=True,
                         )
-
             except asyncio.CancelledError:
-                logger.info("Service received cancel signal")
                 break
             except Exception as exc:
-                logger.error("Unexpected error in main loop: %s", exc, exc_info=True)
+                logger.error("WB poll error: %s", exc, exc_info=True)
                 await asyncio.sleep(self.config.poll_interval_seconds * 2)
 
             await asyncio.sleep(self.config.poll_interval_seconds)
