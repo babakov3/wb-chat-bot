@@ -314,6 +314,48 @@ class ChatService:
                         return str(name)
         return None
 
+    # ── Review chat detection ────────────────────────────────────────────
+
+    # Keywords that indicate WB auto-message about a review
+    _REVIEW_KEYWORDS = (
+        "отзыв", "оценк", "низкой оценк", "оставили отзыв",
+        "негативн", "оценили", "поставили оценку",
+    )
+
+    async def _is_review_chat(
+        self, wb_chat_id: str, store: dict[str, Any], wb: WBClient
+    ) -> bool:
+        """Check if a chat was triggered by a negative review.
+
+        Fetches the chat list and checks if the chat has WB's auto-message
+        about a review/rating. If no auto-message found, this is likely
+        a regular customer inquiry — skip it.
+        """
+        try:
+            chats = await wb.get_chats_list()
+            for chat in chats:
+                cid = chat.get("chatID") or chat.get("chatId")
+                if cid != wb_chat_id:
+                    continue
+
+                # Check lastMessage for review keywords
+                last_msg = chat.get("lastMessage", {})
+                text = (last_msg.get("text") or "").lower()
+                for kw in self._REVIEW_KEYWORDS:
+                    if kw in text:
+                        return True
+
+                # If chat has "Отзыв от" badge, it's a review chat
+                # (this is visible in WB UI but check if API gives similar hints)
+                return False
+
+        except Exception as exc:
+            logger.warning("Could not verify review chat %s: %s", wb_chat_id, exc)
+            # On error, be safe — assume it IS a review chat to not miss it
+            return True
+
+        return False
+
     # ── Filtering (per store) ───────────────────────────────────────────
 
     def _passes_filters(self, event: dict[str, Any], wb_chat_id: str, store: dict[str, Any]) -> bool:
@@ -390,8 +432,21 @@ class ChatService:
             store_id, wb_chat_id, client_name, nm_id, rating, complaint_category,
         )
 
-        # Apply delay (chat already reserved — no race condition)
+        # Check if this is a review-triggered chat (WB auto-message present)
+        # Wait for WB auto-message to arrive first
         await asyncio.sleep(self.config.new_chat_delay_seconds)
+
+        if not await self._is_review_chat(wb_chat_id, store, wb):
+            logger.info(
+                "Store %d: chat %s skipped — not a review chat (no WB auto-message found)",
+                store_id, wb_chat_id,
+            )
+            # Update status to skipped so we don't reprocess
+            self.storage.save_chat(
+                chat_id=wb_chat_id, store_id=store_id,
+                status="skipped", **extra,
+            )
+            return
 
         is_dry_run = store["app_mode"] != "production"
         message_text = store["message_text"]
