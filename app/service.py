@@ -224,6 +224,7 @@ class ChatService:
         return str(eid) if eid else None
 
     def _extract_nm_id(self, event: dict[str, Any]) -> int | None:
+        # Check top-level
         for key in ("nmID", "nmId", "nm_id"):
             val = event.get(key)
             if val is not None:
@@ -231,6 +232,20 @@ class ChatService:
                     return int(val)
                 except (ValueError, TypeError):
                     pass
+        # Check inside message.attachments.goodCard (WB actual format)
+        msg = event.get("message", {})
+        if isinstance(msg, dict):
+            att = msg.get("attachments", {})
+            if isinstance(att, dict):
+                gc = att.get("goodCard", {})
+                if isinstance(gc, dict):
+                    val = gc.get("nmID") or gc.get("nmId")
+                    if val is not None:
+                        try:
+                            return int(val)
+                        except (ValueError, TypeError):
+                            pass
+        # Check payload fallback
         payload = event.get("payload", event.get("data", {}))
         if isinstance(payload, dict):
             for key in ("nmID", "nmId", "nm_id"):
