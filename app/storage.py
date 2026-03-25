@@ -117,6 +117,17 @@ class Storage:
             )
             logger.info("Migration: added store_id to processed_chats")
 
+        # Add notification_group_id to stores if missing
+        store_cols = {
+            r[1]
+            for r in self._conn.execute("PRAGMA table_info(stores)").fetchall()
+        }
+        if "notification_group_id" not in store_cols:
+            self._conn.execute(
+                "ALTER TABLE stores ADD COLUMN notification_group_id TEXT DEFAULT ''"
+            )
+            logger.info("Migration: added notification_group_id to stores")
+
     # ── Stores ───────────────────────────────────────────────────
 
     def create_store(

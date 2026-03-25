@@ -265,6 +265,20 @@ def register_all(
             await settings_ui.handle_callback(chat_id, data, message_id)
         elif data.startswith("ob:"):
             await onboarding.handle_callback(chat_id, data, message_id)
+        elif data.startswith("grp:link:"):
+            # grp:link:<store_id>:<group_id>
+            parts = data.split(":")
+            if len(parts) >= 4:
+                store_id = int(parts[2])
+                group_id = parts[3]
+                store = storage.get_store(store_id)
+                if store:
+                    storage.update_store(store_id, notification_group_id=group_id)
+                    await telegram.send_message(
+                        group_id,
+                        f"✅ Группа привязана к <b>{store['store_name']}</b>\n"
+                        f"Уведомления будут приходить сюда."
+                    )
 
     # ── Text input router ────────────────────────────────────────
 
@@ -293,12 +307,73 @@ def register_all(
                 return None
         return storage.get_store(store_id)
 
+    # ── /connect — link group to store ─────────────────────────────
+
+    async def cmd_connect(chat_id: str) -> None:
+        """Link a Telegram group to a store for notifications.
+        Works in groups: /connect <store_name>
+        """
+        # This is called from a group chat
+        # chat_id here is the group chat ID (negative number)
+        group_id = chat_id
+
+        # Get all stores and find match
+        # For simplicity: if user has only one store, auto-link
+        # If multiple, need store name argument
+        all_stores = storage._conn.execute(
+            "SELECT id, store_name, user_chat_id FROM stores"
+        ).fetchall()
+
+        if not all_stores:
+            await telegram.send_message(group_id, "Нет подключённых магазинов.")
+            return
+
+        if len(all_stores) == 1:
+            store = all_stores[0]
+            storage.update_store(store["id"], notification_group_id=group_id)
+            await telegram.send_message(
+                group_id,
+                f"✅ Группа привязана к магазину <b>{store['store_name']}</b>\n\n"
+                f"Уведомления о новых обращениях и ответах клиентов будут приходить сюда."
+            )
+            return
+
+        # Multiple stores — show buttons to choose
+        rows = []
+        for s in all_stores:
+            rows.append([(
+                f"📎 {s['store_name']}",
+                f"grp:link:{s['id']}:{group_id}"
+            )])
+        markup = _kb(rows)
+        await telegram.send_message(
+            group_id,
+            "Выберите магазин для привязки к этой группе:",
+            reply_markup=markup,
+        )
+
+    async def cmd_disconnect(chat_id: str) -> None:
+        """Unlink group from store."""
+        stores = storage._conn.execute(
+            "SELECT id, store_name FROM stores WHERE notification_group_id = ?",
+            (chat_id,),
+        ).fetchall()
+        if not stores:
+            await telegram.send_message(chat_id, "Эта группа не привязана ни к одному магазину.")
+            return
+        for s in stores:
+            storage.update_store(s["id"], notification_group_id="")
+        names = ", ".join(s["store_name"] for s in stores)
+        await telegram.send_message(chat_id, f"✅ Группа отвязана от: {names}")
+
     # ── Register everything ──────────────────────────────────────
 
     router.register_command("start", cmd_start)
     router.register_command("status", cmd_status)
     router.register_command("analytics", cmd_analytics)
     router.register_command("settings", cmd_settings)
+    router.register_command("connect", cmd_connect)
+    router.register_command("disconnect", cmd_disconnect)
 
     router.register_button(BTN_STATUS, cmd_status)
     router.register_button(BTN_STOP, cmd_stop_all)
