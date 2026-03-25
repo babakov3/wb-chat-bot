@@ -310,46 +310,28 @@ def register_all(
     # ── /connect — link group to store ─────────────────────────────
 
     async def cmd_connect(chat_id: str) -> None:
-        """Link a Telegram group to a store for notifications.
-        Works in groups: /connect <store_name>
-        """
-        # This is called from a group chat
-        # chat_id here is the group chat ID (negative number)
+        """Link a Telegram group to ALL stores at once."""
         group_id = chat_id
 
-        # Get all stores and find match
-        # For simplicity: if user has only one store, auto-link
-        # If multiple, need store name argument
         all_stores = storage._conn.execute(
-            "SELECT id, store_name, user_chat_id FROM stores"
+            "SELECT id, store_name FROM stores"
         ).fetchall()
 
         if not all_stores:
             await telegram.send_message(group_id, "Нет подключённых магазинов.")
             return
 
-        if len(all_stores) == 1:
-            store = all_stores[0]
-            storage.update_store(store["id"], notification_group_id=group_id)
-            await telegram.send_message(
-                group_id,
-                f"✅ Группа привязана к магазину <b>{store['store_name']}</b>\n\n"
-                f"Уведомления о новых обращениях и ответах клиентов будут приходить сюда."
-            )
-            return
-
-        # Multiple stores — show buttons to choose
-        rows = []
+        names = []
         for s in all_stores:
-            rows.append([(
-                f"📎 {s['store_name']}",
-                f"grp:link:{s['id']}:{group_id}"
-            )])
-        markup = _kb(rows)
+            storage.update_store(s["id"], notification_group_id=group_id)
+            names.append(s["store_name"])
+
+        names_str = "\n".join(f"  ✅ {n}" for n in names)
         await telegram.send_message(
             group_id,
-            "Выберите магазин для привязки к этой группе:",
-            reply_markup=markup,
+            f"<b>Группа подключена</b>\n\n"
+            f"{names_str}\n\n"
+            f"Сюда будут приходить уведомления о новых обращениях и ответах клиентов."
         )
 
     async def cmd_disconnect(chat_id: str) -> None:

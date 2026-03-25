@@ -82,15 +82,16 @@ class ChatService:
 
             await asyncio.sleep(self.config.poll_interval_seconds)
 
-    async def _notify(self, store: dict[str, Any], text: str) -> None:
-        """Send notification to user + group (if linked)."""
+    async def _notify(self, store: dict[str, Any], text: str, group: bool = True) -> None:
+        """Send notification to user + group (if linked and group=True)."""
         await self.telegram.notify(store["user_chat_id"], text)
-        group_id = store.get("notification_group_id") or ""
-        if group_id:
-            try:
-                await self.telegram.notify(str(group_id), text)
-            except Exception as exc:
-                logger.warning("Failed to notify group %s: %s", group_id, exc)
+        if group:
+            group_id = store.get("notification_group_id") or ""
+            if group_id:
+                try:
+                    await self.telegram.notify(str(group_id), text)
+                except Exception as exc:
+                    logger.warning("Failed to notify group %s: %s", group_id, exc)
 
     async def stop(self) -> None:
         """Graceful shutdown."""
@@ -560,7 +561,8 @@ class ChatService:
                 f"[{store['store_name']}] 🟡 <b>[ТЕСТ] Негатив</b>\n"
                 f"👤 {name}\n"
                 f"📦 {nm} — {prod}\n"
-                f"{cat}"
+                f"{cat}",
+                group=False,
             )
         else:
             await self._send_production_message(
@@ -631,7 +633,8 @@ class ChatService:
                 f"[{store_name}] ✅ <b>Отправлено</b>\n"
                 f"👤 {name}\n"
                 f"📦 {nm} — {prod}\n"
-                f"{cat}"
+                f"{cat}",
+                group=False,
             )
         except WBApiError as exc:
             logger.error("Store %d: send failed for chat %s: %s", store_id, wb_chat_id, exc)
@@ -645,7 +648,7 @@ class ChatService:
                 error_text=str(exc),
                 **extra,
             )
-            await self._notify(store, f"[{store_name}] ❌ Ошибка отправки: {exc}")
+            await self._notify(store, f"[{store_name}] ❌ Ошибка отправки: {exc}", group=False)
         except Exception as exc:
             logger.error("Store %d: unexpected send error for %s: %s", store_id, wb_chat_id, exc)
             self.storage.save_chat(
@@ -657,7 +660,7 @@ class ChatService:
                 error_text=str(exc),
                 **extra,
             )
-            await self._notify(store, f"[{store_name}] ❌ Ошибка: {exc}")
+            await self._notify(store, f"[{store_name}] ❌ Ошибка: {exc}", group=False)
 
     async def _fetch_reply_sign(self, wb: WBClient, wb_chat_id: str) -> str | None:
         """Try to get replySign from the chats list endpoint."""
