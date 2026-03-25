@@ -327,33 +327,55 @@ class ChatService:
     ) -> bool:
         """Check if a chat was triggered by a negative review.
 
-        Fetches the chat list and checks if the chat has WB's auto-message
-        about a review/rating. If no auto-message found, this is likely
-        a regular customer inquiry — skip it.
+        Verifies WB's auto-message about a review exists.
+        Checks both chats list (lastMessage) and recent events for seller messages
+        containing review keywords. Only returns True if confirmed.
         """
         try:
+            # Method 1: Check chats list — lastMessage
             chats = await wb.get_chats_list()
             for chat in chats:
                 cid = chat.get("chatID") or chat.get("chatId")
                 if cid != wb_chat_id:
                     continue
 
-                # Check lastMessage for review keywords
                 last_msg = chat.get("lastMessage", {})
-                text = (last_msg.get("text") or "").lower()
+                last_text = (last_msg.get("text") or "").lower()
                 for kw in self._REVIEW_KEYWORDS:
-                    if kw in text:
+                    if kw in last_text:
+                        logger.info("Chat %s: review confirmed via lastMessage", wb_chat_id)
                         return True
+                break  # found our chat, no keyword match
 
-                # If chat has "Отзыв от" badge, it's a review chat
-                # (this is visible in WB UI but check if API gives similar hints)
-                return False
+            # Method 2: Check recent events — look for seller message with review keywords
+            cursor = self.storage.get_cursor_for_store(store["id"])
+            if cursor:
+                # Go back 60 seconds to catch WB auto-message
+                check_cursor = max(0, cursor - 60000)
+                try:
+                    data = await wb.get_chat_events(next_cursor=check_cursor)
+                    events = data.get("events", [])
+                    for ev in events:
+                        ev_chat = ev.get("chatID") or ev.get("chatId")
+                        if ev_chat != wb_chat_id:
+                            continue
+                        ev_sender = ev.get("sender", "")
+                        if ev_sender in ("seller", "system", "auto"):
+                            ev_text = ""
+                            msg = ev.get("message", {})
+                            if isinstance(msg, dict):
+                                ev_text = (msg.get("text") or "").lower()
+                            for kw in self._REVIEW_KEYWORDS:
+                                if kw in ev_text:
+                                    logger.info("Chat %s: review confirmed via seller event", wb_chat_id)
+                                    return True
+                except Exception as exc:
+                    logger.warning("Events check failed for chat %s: %s", wb_chat_id, exc)
 
         except Exception as exc:
             logger.warning("Could not verify review chat %s: %s", wb_chat_id, exc)
-            # On error, be safe — assume it IS a review chat to not miss it
-            return True
 
+        logger.info("Chat %s: NOT a review chat — no WB auto-message found", wb_chat_id)
         return False
 
     # ── Filtering (per store) ───────────────────────────────────────────
@@ -432,10 +454,22 @@ class ChatService:
             store_id, wb_chat_id, client_name, nm_id, rating, complaint_category,
         )
 
-        # Check if this is a review-triggered chat (WB auto-message present)
-        # Wait for WB auto-message to arrive first
+        # Quick check: if sender is "client" and message has no review keywords,
+        # this is likely a regular customer inquiry, not a review chat
+        sender = event.get("sender", "")
+        event_text = (client_message or "").lower()
+        if sender == "client":
+            has_review_keyword = any(kw in event_text for kw in self._REVIEW_KEYWORDS)
+            if not has_review_keyword:
+                logger.info(
+                    "Store %d: chat %s — client-initiated, no review keywords in message. Checking WB auto-message...",
+                    store_id, wb_chat_id,
+                )
+
+        # Wait for WB auto-message to arrive
         await asyncio.sleep(self.config.new_chat_delay_seconds)
 
+        # Verify WB sent its auto-message about a review
         if not await self._is_review_chat(wb_chat_id, store, wb):
             logger.info(
                 "Store %d: chat %s skipped — not a review chat (no WB auto-message found)",
