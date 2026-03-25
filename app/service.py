@@ -496,14 +496,15 @@ class ChatService:
                 **extra,
             )
             name = client_name or "?"
-            cat = complaint_category or ""
+            cat = complaint_category or "💬 Другое"
             nm = nm_id or ""
+            prod = product_name or ""
             await self.telegram.notify(
                 user_chat_id,
-                f"[{store['store_name']}] <b>[ТЕСТ] Новый негатив</b>\n"
-                f"Клиент: {name} | Артикул: {nm}\n"
-                f"Категория: {cat}\n"
-                f"Отправили бы: <code>{message_text[:50]}</code>"
+                f"[{store['store_name']}] 🟡 <b>[ТЕСТ] Негатив</b>\n"
+                f"👤 {name}\n"
+                f"📦 {nm} — {prod}\n"
+                f"{cat}"
             )
         else:
             await self._send_production_message(
@@ -566,13 +567,15 @@ class ChatService:
                 **extra,
             )
             name = extra.get("client_name") or "?"
-            cat = extra.get("complaint_category") or ""
             nm = extra.get("nm_id") or ""
+            prod = extra.get("product_name") or ""
+            cat = extra.get("complaint_category") or "💬 Другое"
             await self.telegram.notify(
                 user_chat_id,
-                f"[{store_name}] <b>Сообщение отправлено</b>\n"
-                f"Клиент: {name} | Артикул: {nm}\n"
-                f"Категория: {cat}"
+                f"[{store_name}] ✅ <b>Отправлено</b>\n"
+                f"👤 {name}\n"
+                f"📦 {nm} — {prod}\n"
+                f"{cat}"
             )
         except WBApiError as exc:
             logger.error("Store %d: send failed for chat %s: %s", store_id, wb_chat_id, exc)
