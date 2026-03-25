@@ -77,6 +77,14 @@ TABLES = [
         updated_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS notified_events (
+        event_id TEXT NOT NULL,
+        store_id INTEGER NOT NULL,
+        notified_at TEXT NOT NULL,
+        UNIQUE(event_id, store_id)
+    )
+    """,
 ]
 
 
@@ -284,6 +292,26 @@ class Storage:
                 """,
                 (key, value, now),
             )
+
+    # ── Notified Events ─────────────────────────────────────────
+
+    def is_event_notified(self, event_id: str, store_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM notified_events WHERE event_id = ? AND store_id = ?",
+            (event_id, store_id),
+        ).fetchone()
+        return row is not None
+
+    def mark_event_notified(self, event_id: str, store_id: int) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO notified_events (event_id, store_id, notified_at) VALUES (?, ?, ?)",
+                    (event_id, store_id, now),
+                )
+        except Exception:
+            pass
 
     # ── Processed Chats ──────────────────────────────────────────
 

@@ -166,6 +166,52 @@ class ChatService:
         if new_chat_tasks:
             await asyncio.gather(*new_chat_tasks, return_exceptions=True)
 
+        # Notify about client messages (new inquiries + replies to our messages)
+        for event in events:
+            if self._is_new_chat_event(event):
+                continue  # already handled above
+            sender = event.get("sender", "")
+            if sender != "client":
+                continue
+            wb_chat_id = self._extract_chat_id(event)
+            if not wb_chat_id:
+                continue
+            event_id = self._extract_event_id(event)
+            if not event_id:
+                continue
+            # Deduplicate notifications by event_id
+            if self.storage.is_event_notified(event_id, store_id):
+                continue
+            self.storage.mark_event_notified(event_id, store_id)
+
+            client_name = self._extract_client_name(event) or "?"
+            client_message = self._extract_client_message(event) or ""
+            msg_preview = client_message[:100] + "..." if len(client_message) > 100 else client_message
+            nm_id = self._extract_nm_id(event)
+            product_name = self._extract_product_name(event)
+            if not product_name and nm_id:
+                product_name = self.storage.get_store_product_name(store_id, nm_id)
+
+            # Check if this chat was already processed (reply to our message)
+            is_reply = self.storage.is_chat_processed(wb_chat_id, store_id)
+
+            if is_reply:
+                await self.telegram.notify(
+                    store["user_chat_id"],
+                    f"[{store['store_name']}] 💬 <b>Клиент ответил</b>\n"
+                    f"👤 {client_name}\n"
+                    f"📝 <i>{msg_preview}</i>"
+                )
+            else:
+                prod_label = f"📦 {nm_id} — {product_name}" if nm_id else ""
+                await self.telegram.notify(
+                    store["user_chat_id"],
+                    f"[{store['store_name']}] 📩 <b>Новое сообщение</b>\n"
+                    f"👤 {client_name}\n"
+                    f"{prod_label}\n"
+                    f"📝 <i>{msg_preview}</i>"
+                )
+
     async def _init_cursor_for_store(self, store: dict[str, Any], wb: WBClient) -> None:
         """Initialize cursor for a store — ALWAYS set to current timestamp.
 
