@@ -35,6 +35,7 @@ class TelegramClient:
         text: str,
         parse_mode: str = "HTML",
         reply_markup: dict[str, Any] | None = None,
+        message_thread_id: int | None = None,
     ) -> int | None:
         try:
             payload: dict[str, Any] = {
@@ -44,6 +45,8 @@ class TelegramClient:
             }
             if reply_markup:
                 payload["reply_markup"] = reply_markup
+            if message_thread_id:
+                payload["message_thread_id"] = message_thread_id
             resp = await self._client.post(f"{self._base}/sendMessage", json=payload)
             if resp.status_code == 200:
                 data = resp.json()
@@ -98,8 +101,8 @@ class TelegramClient:
         except Exception as exc:
             logger.debug("TG answer_cq error: %s", exc)
 
-    async def notify(self, chat_id: str, text: str) -> None:
-        await self.send_message(chat_id, text)
+    async def notify(self, chat_id: str, text: str, message_thread_id: int | None = None) -> None:
+        await self.send_message(chat_id, text, message_thread_id=message_thread_id)
 
     # ── Polling ──────────────────────────────────────────────────
 

@@ -102,6 +102,9 @@ class MessageRouter:
                     logger.error("Text input handler error: %s", exc, exc_info=True)
             return
 
+        # Store thread_id in a temporary attribute for /connect to use
+        self._last_thread_id = msg.get("message_thread_id")
+
         # 2. Check /command
         if text.startswith("/"):
             cmd = text.split()[0][1:].split("@")[0].lower()

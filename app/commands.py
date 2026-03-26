@@ -310,28 +310,35 @@ def register_all(
     # ── /connect — link group to store ─────────────────────────────
 
     async def cmd_connect(chat_id: str) -> None:
-        """Link a Telegram group to ALL stores at once."""
+        """Link a Telegram group (and topic) to ALL stores at once."""
         group_id = chat_id
+        thread_id = getattr(router, '_last_thread_id', None)
 
         all_stores = storage._conn.execute(
             "SELECT id, store_name FROM stores"
         ).fetchall()
 
         if not all_stores:
-            await telegram.send_message(group_id, "Нет подключённых магазинов.")
+            await telegram.send_message(group_id, "Нет подключённых магазинов.", message_thread_id=thread_id)
             return
 
         names = []
         for s in all_stores:
-            storage.update_store(s["id"], notification_group_id=group_id)
+            storage.update_store(
+                s["id"],
+                notification_group_id=group_id,
+                notification_thread_id=str(thread_id) if thread_id else "",
+            )
             names.append(s["store_name"])
 
         names_str = "\n".join(f"  ✅ {n}" for n in names)
+        topic_note = " (топик привязан)" if thread_id else ""
         await telegram.send_message(
             group_id,
-            f"<b>Группа подключена</b>\n\n"
+            f"<b>Группа подключена{topic_note}</b>\n\n"
             f"{names_str}\n\n"
-            f"Сюда будут приходить уведомления о новых обращениях и ответах клиентов."
+            f"Сюда будут приходить уведомления о новых обращениях и ответах клиентов.",
+            message_thread_id=thread_id,
         )
 
     async def cmd_disconnect(chat_id: str) -> None:

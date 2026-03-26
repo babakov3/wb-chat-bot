@@ -88,8 +88,10 @@ class ChatService:
         if group:
             group_id = store.get("notification_group_id") or ""
             if group_id:
+                thread_id_str = store.get("notification_thread_id") or ""
+                thread_id = int(thread_id_str) if thread_id_str else None
                 try:
-                    await self.telegram.notify(str(group_id), text)
+                    await self.telegram.notify(str(group_id), text, message_thread_id=thread_id)
                 except Exception as exc:
                     logger.warning("Failed to notify group %s: %s", group_id, exc)
 

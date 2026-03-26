@@ -127,6 +127,11 @@ class Storage:
                 "ALTER TABLE stores ADD COLUMN notification_group_id TEXT DEFAULT ''"
             )
             logger.info("Migration: added notification_group_id to stores")
+        if "notification_thread_id" not in store_cols:
+            self._conn.execute(
+                "ALTER TABLE stores ADD COLUMN notification_thread_id TEXT DEFAULT ''"
+            )
+            logger.info("Migration: added notification_thread_id to stores")
 
     # ── Stores ───────────────────────────────────────────────────
 
