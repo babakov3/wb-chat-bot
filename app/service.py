@@ -9,6 +9,7 @@ from typing import Any
 
 from app.categorizer import categorize_complaint
 from app.config import Config
+from app.review_monitor import ReviewMonitor
 from app.storage import Storage
 from app.telegram_client import TelegramClient
 from app.wb_client import WBApiError, WBClient, WBClientPool
@@ -32,7 +33,9 @@ class ChatService:
         self._running: bool = False
         self._poll_count: int = 0
         self._last_heartbeat: datetime = datetime.now(timezone.utc)
+        self._last_review_check: datetime = datetime.now(timezone.utc)
         self._store_semaphores: dict[int, asyncio.Semaphore] = {}
+        self._review_monitor = ReviewMonitor(storage, telegram, wb_pool)
 
     def _get_semaphore(self, store_id: int) -> asyncio.Semaphore:
         if store_id not in self._store_semaphores:
@@ -61,9 +64,13 @@ class ChatService:
 
     async def _wb_loop(self) -> None:
         """WB events polling loop — separate from Telegram for speed."""
+        # Take initial review snapshot on startup (after 30 sec delay)
+        asyncio.get_event_loop().call_later(30, lambda: asyncio.ensure_future(self._review_check()))
+
         while self._running:
             try:
                 await self._heartbeat()
+                await self._maybe_review_check()
                 active_stores = self.storage.get_all_active_stores()
                 for store in active_stores:
                     try:
@@ -81,6 +88,27 @@ class ChatService:
                 await asyncio.sleep(self.config.poll_interval_seconds * 2)
 
             await asyncio.sleep(self.config.poll_interval_seconds)
+
+    async def _maybe_review_check(self) -> None:
+        """Run review snapshot every hour."""
+        now = datetime.now(timezone.utc)
+        elapsed = (now - self._last_review_check).total_seconds()
+        if elapsed < 3600:  # 1 hour
+            return
+        await self._review_check()
+
+    async def _review_check(self) -> None:
+        """Take review snapshots for all active stores."""
+        self._last_review_check = datetime.now(timezone.utc)
+        try:
+            active_stores = self.storage.get_all_active_stores()
+            for store in active_stores:
+                try:
+                    await self._review_monitor.run_snapshot(store)
+                except Exception as exc:
+                    logger.error("Review snapshot error for store %d: %s", store["id"], exc)
+        except Exception as exc:
+            logger.error("Review check error: %s", exc)
 
     async def _notify(self, store: dict[str, Any], text: str, group: bool = True) -> None:
         """Send notification to user + group (if linked and group=True)."""

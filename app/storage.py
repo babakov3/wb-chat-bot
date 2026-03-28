@@ -85,6 +85,21 @@ TABLES = [
         UNIQUE(event_id, store_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS review_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        store_id INTEGER NOT NULL,
+        nm_id INTEGER NOT NULL,
+        product_name TEXT NOT NULL DEFAULT '',
+        review_count INTEGER NOT NULL,
+        snapshot_at TEXT NOT NULL,
+        FOREIGN KEY(store_id) REFERENCES stores(id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_review_snapshots_store_nm
+    ON review_snapshots(store_id, nm_id, snapshot_at)
+    """,
 ]
 
 
@@ -531,6 +546,46 @@ class Storage:
             pass
 
         logger.info("Legacy migration complete: store_id=%d", store_id)
+
+    # ── Review Snapshots ────────────────────────────────────────
+
+    def save_review_snapshot(
+        self, store_id: int, nm_id: int, product_name: str, review_count: int,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO review_snapshots (store_id, nm_id, product_name, review_count, snapshot_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (store_id, nm_id, product_name, review_count, now),
+            )
+
+    def get_previous_snapshot(
+        self, store_id: int, nm_id: int,
+    ) -> dict[str, Any] | None:
+        """Get the most recent snapshot before the current one."""
+        row = self._conn.execute(
+            "SELECT review_count, snapshot_at FROM review_snapshots "
+            "WHERE store_id = ? AND nm_id = ? "
+            "ORDER BY snapshot_at DESC LIMIT 1",
+            (store_id, nm_id),
+        ).fetchone()
+        if row:
+            return {"review_count": row["review_count"], "snapshot_at": row["snapshot_at"]}
+        return None
+
+    def get_all_latest_snapshots(self, store_id: int) -> list[dict[str, Any]]:
+        """Get the latest snapshot for each product in a store."""
+        rows = self._conn.execute(
+            """SELECT nm_id, product_name, review_count, snapshot_at
+            FROM review_snapshots rs1
+            WHERE store_id = ? AND snapshot_at = (
+                SELECT MAX(snapshot_at) FROM review_snapshots rs2
+                WHERE rs2.store_id = rs1.store_id AND rs2.nm_id = rs1.nm_id
+            )""",
+            (store_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self) -> None:
         self._conn.close()
