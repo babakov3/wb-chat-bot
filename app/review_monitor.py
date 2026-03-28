@@ -1,4 +1,9 @@
-"""Review monitoring: periodic snapshots of review counts, alerts on anomalies."""
+"""Мониторинг отзывов: периодические снимки количества отзывов и оповещения при аномалиях.
+
+Модуль делает снимки (snapshot) количества отзывов по каждому товару магазина
+и сравнивает с предыдущими. Если суммарное падение превышает ALERT_THRESHOLD —
+отправляет уведомление владельцу и в привязанную группу.
+"""
 
 from __future__ import annotations
 
@@ -11,17 +16,29 @@ from app.wb_client import WBClient, WBClientPool
 
 logger = logging.getLogger("wb_chat_bot")
 
-# Minimum drop to trigger an alert (absolute number)
+# Минимальное суммарное падение количества отзывов для срабатывания оповещения.
+# Если разница между предыдущим и текущим снимком >= ALERT_THRESHOLD отзывов —
+# отправляется уведомление. Значение 5 выбрано, чтобы отфильтровать
+# незначительные колебания (например, удаление 1-2 спам-отзывов модерацией).
 ALERT_THRESHOLD = 5
 
 
 class ReviewMonitor:
+    """Монитор отзывов: сравнивает снимки и оповещает при массовом удалении."""
+
     def __init__(
         self,
         storage: Storage,
         telegram: TelegramClient,
         wb_pool: WBClientPool,
     ) -> None:
+        """Инициализация монитора отзывов.
+
+        Args:
+            storage: Хранилище данных для сохранения снимков и чтения предыдущих.
+            telegram: Клиент Telegram для отправки уведомлений.
+            wb_pool: Пул WB-клиентов (не используется напрямую — токен берётся из store).
+        """
         self.storage = storage
         self.telegram = telegram
         self.wb_pool = wb_pool
@@ -120,7 +137,24 @@ class ReviewMonitor:
             )
 
     async def _fetch_review_counts(self, token: str) -> dict[int, dict[str, Any]]:
-        """Fetch all reviews and count per product. Handles pagination."""
+        """Загружает все отзывы из WB Feedbacks API и считает количество по товарам.
+
+        Обрабатывает пагинацию: запрашивает по 5000 отзывов за раз (максимум API),
+        до 20 страниц (safety limit = 100 000 отзывов).
+
+        Запрашиваются как отвеченные (isAnswered=true), так и неотвеченные
+        (isAnswered=false) отзывы, потому что для корректного подсчёта общего
+        количества нужны ОБА типа. Если считать только отвеченные — при
+        появлении нового неотвеченного отзыва счётчик не изменится, а при
+        удалении отвеченного будет ложная тревога без полной картины.
+
+        Args:
+            token: WB API токен с правами на Feedbacks.
+
+        Returns:
+            Словарь {nm_id: {"name": str, "count": int}} с количеством отзывов
+            по каждому товару.
+        """
         import httpx
 
         counts: dict[int, dict[str, Any]] = {}

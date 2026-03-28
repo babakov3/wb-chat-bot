@@ -1,16 +1,22 @@
-"""4-step onboarding wizard for adding a new store.
+"""Пошаговый мастер подключения нового магазина (онбординг).
 
-Steps:
-  1/4 — Store name
-  2/4 — WB API token (validated)
-  3/4 — Message template (preview full text, choose, enter contact)
-  4/4 — Product selection
+Шаги:
+  1/4 — Название магазина
+  2/4 — WB API токен (с валидацией через WB API)
+  3/4 — Шаблон сообщения (превью, выбор, ввод контакта)
+  4/4 — Выбор товаров для отслеживания
 
-State is stored in user_state: onboarding_step + onboarding_data (JSON).
-Callback prefix: ob:
+Состояние хранится в user_state:
+  - onboarding_step — текущий шаг ("1", "2", "3", "4")
+  - onboarding_data — JSON с накопленными данными (имя, токен, товары и т.д.)
+  - input_waiting — тип ожидаемого текстового ввода (ob:name, ob:token и т.д.)
 
-A single bot message is sent at the start and edited throughout the wizard.
-The message_id is persisted in onboarding_data["msg_id"].
+Соглашение о префиксах callback_data:
+  ``ob:`` — все callback-кнопки мастера онбординга используют этот префикс.
+  Примеры: ob:cancel, ob:back:2, ob:tpl:0, ob:prod:all, ob:pt:<nm_id>, ob:pp:<page>.
+
+Для минимизации сообщений в чате бот создаёт одно сообщение при старте
+и редактирует его на каждом шаге. ID сообщения хранится в onboarding_data["msg_id"].
 """
 
 from __future__ import annotations
@@ -26,6 +32,8 @@ from app.wb_client import WBApiError, WBClient
 
 logger = logging.getLogger("wb_chat_bot")
 
+# Количество товаров на одной странице при выборе на шаге 4.
+# Ограничено из-за лимита Telegram на количество inline-кнопок в сообщении.
 PAGE_SIZE = 8
 
 
@@ -37,6 +45,12 @@ class OnboardingWizard:
         storage: Storage,
         telegram: TelegramClient,
     ) -> None:
+        """Инициализация мастера онбординга.
+
+        Args:
+            storage: Хранилище данных (SQLite) для сохранения состояния и создания магазина.
+            telegram: Клиент Telegram Bot API для отправки/редактирования сообщений.
+        """
         self._storage = storage
         self._tg = telegram
 
@@ -113,6 +127,11 @@ class OnboardingWizard:
     # ── Step 1: Store name ───────────────────────────────────────
 
     async def _step_1_name(self, chat_id: str) -> None:
+        """Шаг 1/4: Запрашивает название магазина.
+
+        Устанавливает input_waiting="ob:name" и редактирует сообщение
+        с инструкцией для пользователя.
+        """
         self._set_step(chat_id, "1")
         self._storage.set_user_state(chat_id, input_waiting="ob:name")
         text = (
@@ -126,6 +145,11 @@ class OnboardingWizard:
     # ── Step 2: API token ────────────────────────────────────────
 
     async def _step_2_token(self, chat_id: str) -> None:
+        """Шаг 2/4: Запрашивает WB API токен.
+
+        Показывает инструкцию по получению токена и устанавливает
+        input_waiting="ob:token". Валидация происходит в handle_text.
+        """
         self._set_step(chat_id, "2")
         self._storage.set_user_state(chat_id, input_waiting="ob:token")
         data = self._get_data(chat_id)
@@ -144,6 +168,12 @@ class OnboardingWizard:
     # ── Step 3: Message ──────────────────────────────────────────
 
     async def _step_3_message(self, chat_id: str) -> None:
+        """Шаг 3/4: Выбор шаблона сообщения или ввод своего.
+
+        Показывает список готовых шаблонов из TEMPLATES и кнопку «Написать своё».
+        При выборе шаблона — показывается превью, при нажатии «Использовать» —
+        запрашивается контакт (если в шаблоне есть {contact}).
+        """
         self._set_step(chat_id, "3")
         self._storage.set_user_state(chat_id, input_waiting=None)
         text = (
@@ -160,7 +190,15 @@ class OnboardingWizard:
         await self._edit(chat_id, text, reply_markup=_kb(rows))
 
     async def _show_template_preview(self, chat_id: str, idx: int) -> None:
-        """Show full template text with Use / Back buttons."""
+        """Показывает полный текст шаблона с кнопками «Использовать» / «Назад».
+
+        Сохраняет индекс выбранного шаблона в onboarding_data["tpl_idx"]
+        для последующего применения.
+
+        Args:
+            chat_id: Идентификатор чата Telegram.
+            idx: Индекс шаблона в массиве TEMPLATES.
+        """
         if idx < 0 or idx >= len(TEMPLATES):
             return
         tpl = TEMPLATES[idx]
@@ -182,7 +220,11 @@ class OnboardingWizard:
         await self._edit(chat_id, text, reply_markup=markup)
 
     async def _ask_contact(self, chat_id: str) -> None:
-        """Ask user for their contact (for {contact} placeholder)."""
+        """Запрашивает контакт пользователя для подстановки в плейсхолдер {contact}.
+
+        Устанавливает input_waiting="ob:contact". Контакт обрабатывается
+        в handle_text и подставляется в текст выбранного шаблона.
+        """
         self._storage.set_user_state(chat_id, input_waiting="ob:contact")
         data = self._get_data(chat_id)
         tpl_idx = data.get("tpl_idx", 0)
@@ -196,7 +238,11 @@ class OnboardingWizard:
         await self._edit(chat_id, text, reply_markup=markup)
 
     async def _prompt_custom_message(self, chat_id: str) -> None:
-        """Ask user to type their own message."""
+        """Запрашивает у пользователя произвольный текст сообщения.
+
+        Устанавливает input_waiting="ob:msg". Текст сохраняется
+        в onboarding_data["message_text"] через handle_text.
+        """
         self._storage.set_user_state(chat_id, input_waiting="ob:msg")
         text = (
             "<b>Напишите сообщение</b>\n\n"
@@ -211,6 +257,12 @@ class OnboardingWizard:
     # ── Step 4: Products ─────────────────────────────────────────
 
     async def _step_4_products(self, chat_id: str) -> None:
+        """Шаг 4/4: Выбор товаров для отслеживания.
+
+        Предлагает два варианта: отслеживать все товары или выбрать
+        конкретные из каталога WB. При выборе «из каталога» загружаются
+        карточки товаров через WB Content API.
+        """
         self._set_step(chat_id, "4")
         self._storage.set_user_state(chat_id, input_waiting=None)
 
@@ -226,7 +278,18 @@ class OnboardingWizard:
         await self._edit(chat_id, text, reply_markup=markup)
 
     async def _load_and_show_products(self, chat_id: str, page: int = 0) -> None:
-        """Load products from WB and show picker."""
+        """Загружает каталог товаров из WB Content API и показывает выбор с пагинацией.
+
+        При первом вызове загружает карточки товаров через WBClient.get_product_cards()
+        и кэширует их в onboarding_data["products"]. На последующих вызовах
+        (переключение страниц, выбор товара) использует кэш.
+
+        Каждая страница содержит PAGE_SIZE товаров с чекбоксами и навигацией.
+
+        Args:
+            chat_id: Идентификатор чата Telegram.
+            page: Номер страницы (с нуля).
+        """
         data = self._get_data(chat_id)
         api_token = data.get("api_token", "")
         products = data.get("products", [])
@@ -375,7 +438,13 @@ class OnboardingWizard:
     # ── Callback handler ─────────────────────────────────────────
 
     async def handle_callback(self, chat_id: str, data: str, message_id: int) -> None:
-        """Handle all ob: callbacks."""
+        """Диспетчер всех callback-запросов с префиксом ``ob:``.
+
+        Обрабатывает навигацию (ob:back:N, ob:cancel), выбор шаблонов
+        (ob:tpl:N, ob:tpl:use, ob:msg:custom), управление товарами
+        (ob:prod:all, ob:prod:pick, ob:prod:selall, ob:prod:none,
+        ob:pt:<nm_id>, ob:pp:<page>, ob:prod:done).
+        """
         parts = data.split(":")
 
         # Cancel
@@ -471,10 +540,20 @@ class OnboardingWizard:
     # ── Text input handler ───────────────────────────────────────
 
     async def handle_text(self, chat_id: str, text: str, user_msg_id: int = 0) -> None:
-        """Handle free-text input during onboarding.
+        """Обрабатывает текстовый ввод пользователя во время онбординга.
 
-        user_msg_id is the id of the user's text message so we can delete it
-        to keep the chat clean.
+        Определяет тип ожидаемого ввода по полю input_waiting:
+          - ``ob:name``    — название магазина (шаг 1) -> переход к шагу 2
+          - ``ob:token``   — API токен (шаг 2) -> валидация и переход к шагу 3
+          - ``ob:contact`` — контакт для шаблона (шаг 3) -> переход к шагу 4
+          - ``ob:msg``     — произвольное сообщение (шаг 3) -> переход к шагу 4
+
+        Сообщение пользователя удаляется для чистоты чата (если user_msg_id задан).
+
+        Args:
+            chat_id: Идентификатор чата Telegram.
+            text: Текст, отправленный пользователем.
+            user_msg_id: ID сообщения пользователя для удаления (0 = не удалять).
         """
         user_state = self._storage.get_user_state(chat_id)
         if not user_state:

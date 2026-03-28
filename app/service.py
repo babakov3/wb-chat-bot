@@ -18,6 +18,27 @@ logger = logging.getLogger("wb_chat_bot")
 
 
 class ChatService:
+    """Сервис опроса чатов Wildberries для нескольких магазинов.
+
+    Архитектура: два параллельных цикла (asyncio.gather):
+      1. _telegram_loop — быстрый опрос Telegram-обновлений (1 сек интервал)
+         для моментального отклика на команды пользователя.
+      2. _wb_loop — опрос событий WB API для всех активных магазинов
+         с настраиваемым интервалом (config.poll_interval_seconds).
+
+    Для каждого магазина ведётся собственный курсор (timestamp в мс),
+    который хранится в Storage. При первом запуске курсор устанавливается
+    на текущий момент — старые чаты НЕ обрабатываются.
+
+    Конвейер обработки нового чата:
+      reserve (атомарная запись в БД) -> delay (ожидание авто-сообщения WB)
+      -> verify review (проверка, что чат вызван отзывом) -> send (отправка
+      ответа продавца через WB API).
+
+    Параллельность ограничена семафором (3 на магазин), чтобы не превысить
+    лимиты WB API.
+    """
+
     def __init__(
         self,
         config: Config,
@@ -25,6 +46,14 @@ class ChatService:
         telegram: TelegramClient,
         wb_pool: WBClientPool,
     ) -> None:
+        """Инициализация сервиса со всеми зависимостями.
+
+        Args:
+            config: Конфигурация приложения (интервалы опроса, задержки, и т.д.).
+            storage: SQLite-хранилище (магазины, чаты, курсоры, аналитика).
+            telegram: Клиент Telegram Bot API для уведомлений и обработки команд.
+            wb_pool: Пул HTTP-клиентов WB API, по одному на магазин.
+        """
         self.config = config
         self.storage = storage
         self.telegram = telegram
@@ -38,7 +67,16 @@ class ChatService:
         self._review_monitor = ReviewMonitor(storage, telegram, wb_pool)
 
     def _get_semaphore(self, store_id: int) -> asyncio.Semaphore:
+        """Возвращает семафор для ограничения параллельных запросов к WB API на магазин.
+
+        Лимит = 3 одновременных обработки чатов на магазин. Это предотвращает
+        превышение rate-limit WB API при всплеске новых чатов (например, после
+        массовой рассылки). Семафоры создаются лениво при первом обращении
+        к магазину и кешируются на всё время работы сервиса.
+        """
         if store_id not in self._store_semaphores:
+            # Лимит 3 — эмпирически подобранное значение: WB API допускает
+            # ~5 запросов/сек на токен, а каждая обработка чата делает 2-3 запроса.
             self._store_semaphores[store_id] = asyncio.Semaphore(3)
         return self._store_semaphores[store_id]
 
@@ -64,7 +102,8 @@ class ChatService:
 
     async def _wb_loop(self) -> None:
         """WB events polling loop — separate from Telegram for speed."""
-        # Take initial review snapshot on startup (after 30 sec delay)
+        # Первый снимок отзывов делаем через 30 сек после старта,
+        # чтобы дать время на инициализацию курсоров для всех магазинов
         asyncio.get_event_loop().call_later(30, lambda: asyncio.ensure_future(self._review_check()))
 
         while self._running:
@@ -90,15 +129,26 @@ class ChatService:
             await asyncio.sleep(self.config.poll_interval_seconds)
 
     async def _maybe_review_check(self) -> None:
-        """Run review snapshot every hour."""
+        """Запускает снимок отзывов раз в час.
+
+        Проверяет, прошёл ли час с последнего снимка. Если да — вызывает
+        _review_check() для всех активных магазинов. Интервал 1 час выбран
+        как компромисс между оперативностью и нагрузкой на WB Content API.
+        """
         now = datetime.now(timezone.utc)
         elapsed = (now - self._last_review_check).total_seconds()
-        if elapsed < 3600:  # 1 hour
+        if elapsed < 3600:  # 1 час — интервал между снимками отзывов
             return
         await self._review_check()
 
     async def _review_check(self) -> None:
-        """Take review snapshots for all active stores."""
+        """Делает снимок количества отзывов для всех активных магазинов.
+
+        Обходит все активные магазины и вызывает ReviewMonitor.run_snapshot()
+        для каждого. Снимки сохраняются в БД и используются для обнаружения
+        новых отзывов (сравнение текущего и предыдущего снимка).
+        Ошибки в одном магазине не прерывают обработку остальных.
+        """
         self._last_review_check = datetime.now(timezone.utc)
         try:
             active_stores = self.storage.get_all_active_stores()
@@ -111,7 +161,16 @@ class ChatService:
             logger.error("Review check error: %s", exc)
 
     async def _notify(self, store: dict[str, Any], text: str, group: bool = True) -> None:
-        """Send notification to user + group (if linked and group=True)."""
+        """Отправляет уведомление пользователю и (опционально) в группу Telegram.
+
+        Двойная схема уведомлений:
+          1. Личное сообщение пользователю (user_chat_id) — всегда.
+          2. Сообщение в групповой чат (notification_group_id) — если group=True
+             и группа привязана к магазину. Поддерживает темы (threads):
+             если задан notification_thread_id, сообщение идёт в конкретную тему.
+
+        Ошибка отправки в группу не прерывает работу — только логируется.
+        """
         await self.telegram.notify(store["user_chat_id"], text)
         if group:
             group_id = store.get("notification_group_id") or ""
@@ -139,7 +198,7 @@ class ChatService:
         wb = self.wb_pool.get(store_id, api_token)
         cursor = self.storage.get_cursor_for_store(store_id)
 
-        # Initialize cursor on first poll
+        # При первом опросе инициализируем курсор на текущий момент
         if cursor is None:
             await self._init_cursor_for_store(store, wb)
             return
@@ -176,7 +235,7 @@ class ChatService:
         if events:
             logger.debug("Store %d: %d events", store_id, len(events))
 
-        # Process new chat events with atomic reservation
+        # Обработка новых чатов с атомарным резервированием
         sem = self._get_semaphore(store_id)
         new_chat_tasks = []
         for event in events:
@@ -186,7 +245,7 @@ class ChatService:
                     continue
                 if not self._passes_filters(event, wb_chat_id, store):
                     continue
-                # Atomic reservation — prevents race conditions
+                # Атомарное резервирование — предотвращает гонку при параллельной обработке
                 event_id = self._extract_event_id(event)
                 reply_sign = self._extract_reply_sign(event)
                 nm_id = self._extract_nm_id(event)
@@ -199,7 +258,7 @@ class ChatService:
                     rating=self._extract_rating(event),
                 )
                 if not reserved:
-                    continue  # already being processed or done
+                    continue  # уже обрабатывается или обработан
                 new_chat_tasks.append(
                     self._handle_reserved_chat(event, wb_chat_id, store, wb, sem)
                 )
@@ -207,10 +266,10 @@ class ChatService:
         if new_chat_tasks:
             await asyncio.gather(*new_chat_tasks, return_exceptions=True)
 
-        # Notify about client messages (new inquiries + replies to our messages)
+        # Уведомления о сообщениях клиентов (новые обращения + ответы на наши сообщения)
         for event in events:
             if self._is_new_chat_event(event):
-                continue  # already handled above
+                continue  # уже обработано выше
             sender = event.get("sender", "")
             if sender != "client":
                 continue
@@ -220,7 +279,7 @@ class ChatService:
             event_id = self._extract_event_id(event)
             if not event_id:
                 continue
-            # Deduplicate notifications by event_id
+            # Дедупликация уведомлений по event_id
             if self.storage.is_event_notified(event_id, store_id):
                 continue
             self.storage.mark_event_notified(event_id, store_id)
@@ -233,7 +292,7 @@ class ChatService:
             if not product_name and nm_id:
                 product_name = self.storage.get_store_product_name(store_id, nm_id)
 
-            # Check if this chat was already processed (reply to our message)
+            # Проверяем, был ли этот чат уже обработан (ответ на наше сообщение)
             is_reply = self.storage.is_chat_processed(wb_chat_id, store_id)
 
             if is_reply:
@@ -261,6 +320,9 @@ class ChatService:
         (after this moment) will be processed.
         """
         store_id = store["id"]
+        # Используем текущий timestamp в миллисекундах — все события ДО этого момента
+        # будут проигнорированы. Это критически важно: без этого бот мог бы ответить
+        # на сотни старых чатов при первом подключении магазина.
         ts = WBClient.current_timestamp_ms()
         self.storage.save_cursor_for_store(store_id, ts)
         logger.info(
@@ -270,8 +332,24 @@ class ChatService:
         # No user-facing message — the onboarding completion message is enough
 
     # ── Event field extraction ──────────────────────────────────────────
+    #
+    # WB API возвращает разные имена полей в зависимости от версии API,
+    # типа эндпоинта и даже времени (формат менялся несколько раз).
+    # Поэтому каждый _extract_* метод пробует несколько вариантов имён:
+    #   - camelCase (chatID, nmID) — основной формат v1/v2
+    #   - mixed case (chatId, nmId) — встречается в некоторых ответах
+    #   - snake_case (chat_id, nm_id) — формат документации
+    #   - вложенные в payload/data — некоторые эндпоинты оборачивают данные
+    #   - вложенные в message.attachments.goodCard — формат карточки товара
+    #
 
     def _is_new_chat_event(self, event: dict[str, Any]) -> bool:
+        """Определяет, является ли событие созданием нового чата.
+
+        Проверяет флаг isNewChat на верхнем уровне и внутри payload/data.
+        WB может поместить этот флаг в разные места в зависимости от
+        версии API.
+        """
         if event.get("isNewChat"):
             return True
         payload = event.get("payload", event.get("data", {}))
@@ -280,6 +358,11 @@ class ChatService:
         return False
 
     def _extract_chat_id(self, event: dict[str, Any]) -> str | None:
+        """Извлекает ID чата WB из события.
+
+        WB использует разные имена поля: chatID (основной), chatId, chat_id.
+        Ищет на верхнем уровне события и внутри payload/data.
+        """
         chat_id = event.get("chatID") or event.get("chatId") or event.get("chat_id")
         if chat_id:
             return str(chat_id)
@@ -291,6 +374,12 @@ class ChatService:
         return None
 
     def _extract_reply_sign(self, event: dict[str, Any]) -> str | None:
+        """Извлекает replySign — токен для отправки ответа в чат.
+
+        Без replySign отправить сообщение в чат WB невозможно. Поле может
+        называться replySign или reply_sign, может быть на верхнем уровне
+        или внутри payload/data.
+        """
         rs = event.get("replySign") or event.get("reply_sign")
         if rs:
             return str(rs)
@@ -302,6 +391,12 @@ class ChatService:
         return None
 
     def _extract_event_id(self, event: dict[str, Any]) -> str | None:
+        """Извлекает уникальный ID события.
+
+        Используется для дедупликации: один и тот же чат может прийти
+        в нескольких событиях. Поле может называться eventID, eventId,
+        id или event_id.
+        """
         eid = (
             event.get("eventID")
             or event.get("eventId")
@@ -311,7 +406,14 @@ class ChatService:
         return str(eid) if eid else None
 
     def _extract_nm_id(self, event: dict[str, Any]) -> int | None:
-        # Check top-level
+        """Извлекает nmID (артикул WB) — идентификатор товара.
+
+        Пробует три уровня вложенности:
+          1. Верхний уровень события (nmID, nmId, nm_id)
+          2. message.attachments.goodCard — реальный формат WB для карточки товара
+          3. payload/data — обёртка некоторых эндпоинтов
+        """
+        # Проверяем верхний уровень
         for key in ("nmID", "nmId", "nm_id"):
             val = event.get(key)
             if val is not None:
@@ -319,7 +421,7 @@ class ChatService:
                     return int(val)
                 except (ValueError, TypeError):
                     pass
-        # Check inside message.attachments.goodCard (WB actual format)
+        # Проверяем message.attachments.goodCard (актуальный формат WB)
         msg = event.get("message", {})
         if isinstance(msg, dict):
             att = msg.get("attachments", {})
@@ -332,7 +434,7 @@ class ChatService:
                             return int(val)
                         except (ValueError, TypeError):
                             pass
-        # Check payload fallback
+        # Проверяем payload/data как fallback
         payload = event.get("payload", event.get("data", {}))
         if isinstance(payload, dict):
             for key in ("nmID", "nmId", "nm_id"):
@@ -345,6 +447,11 @@ class ChatService:
         return None
 
     def _extract_rating(self, event: dict[str, Any]) -> int | None:
+        """Извлекает оценку (рейтинг) из события.
+
+        WB использует разные имена: rating, valuation, grade. Ищет на
+        верхнем уровне и внутри payload/data.
+        """
         for key in ("rating", "valuation", "grade"):
             val = event.get(key)
             if val is not None:
@@ -364,6 +471,11 @@ class ChatService:
         return None
 
     def _extract_client_name(self, event: dict[str, Any]) -> str | None:
+        """Извлекает имя клиента из события.
+
+        Поле может называться clientName или client_name, может быть
+        на верхнем уровне или внутри payload/data.
+        """
         name = event.get("clientName") or event.get("client_name")
         if name:
             return str(name)
@@ -375,6 +487,11 @@ class ChatService:
         return None
 
     def _extract_client_message(self, event: dict[str, Any]) -> str | None:
+        """Извлекает текст сообщения клиента.
+
+        Текст находится в message.text. В некоторых версиях API
+        message вложен в payload/data.
+        """
         msg = event.get("message", {})
         if isinstance(msg, dict):
             text = msg.get("text")
@@ -390,6 +507,12 @@ class ChatService:
         return None
 
     def _extract_product_name(self, event: dict[str, Any]) -> str | None:
+        """Извлекает название товара из карточки, прикреплённой к сообщению.
+
+        Название находится в message.attachments.goodCard.name.
+        Если карточка не прикреплена (бывает для старых чатов),
+        название берётся из таблицы store_products по nmID.
+        """
         msg = event.get("message", {})
         if isinstance(msg, dict):
             att = msg.get("attachments", {})
@@ -403,7 +526,7 @@ class ChatService:
 
     # ── Review chat detection ────────────────────────────────────────────
 
-    # Keywords that indicate WB auto-message about a review
+    # Ключевые слова, указывающие на авто-сообщение WB об отзыве
     _REVIEW_KEYWORDS = (
         "отзыв", "оценк", "низкой оценк", "оставили отзыв",
         "негативн", "оценили", "поставили оценку",
@@ -412,14 +535,23 @@ class ChatService:
     async def _is_review_chat(
         self, wb_chat_id: str, store: dict[str, Any], wb: WBClient
     ) -> bool:
-        """Check if a chat was triggered by a negative review.
+        """Проверяет, был ли чат создан из-за негативного отзыва.
 
-        Verifies WB's auto-message about a review exists.
-        Checks both chats list (lastMessage) and recent events for seller messages
-        containing review keywords. Only returns True if confirmed.
+        Использует два метода верификации (на случай, если один не сработает):
+
+        Метод 1: Список чатов (get_chats_list) — проверяет lastMessage
+        на наличие ключевых слов об отзыве. Быстрый, но lastMessage может
+        уже быть перезаписан более поздним сообщением.
+
+        Метод 2: Лента событий (get_chat_events) — смотрит события за последние
+        60 секунд, ищет сообщения от seller/system/auto с ключевыми словами.
+        Более надёжный, но требует дополнительного запроса к API.
+
+        Возвращает True только если подтверждено наличие авто-сообщения WB.
+        Если ни один метод не нашёл подтверждения — чат пропускается (не отзыв).
         """
         try:
-            # Method 1: Check chats list — lastMessage
+            # Метод 1: Проверка lastMessage в списке чатов
             chats = await wb.get_chats_list()
             for chat in chats:
                 cid = chat.get("chatID") or chat.get("chatId")
@@ -432,12 +564,13 @@ class ChatService:
                     if kw in last_text:
                         logger.info("Chat %s: review confirmed via lastMessage", wb_chat_id)
                         return True
-                break  # found our chat, no keyword match
+                break  # нашли нужный чат, ключевых слов нет
 
-            # Method 2: Check recent events — look for seller message with review keywords
+            # Метод 2: Проверка ленты событий — ищем авто-сообщение WB
             cursor = self.storage.get_cursor_for_store(store["id"])
             if cursor:
-                # Go back 60 seconds to catch WB auto-message
+                # Откатываемся на 60 секунд назад, чтобы поймать авто-сообщение WB,
+                # которое могло прийти чуть раньше нашего события
                 check_cursor = max(0, cursor - 60000)
                 try:
                     data = await wb.get_chat_events(next_cursor=check_cursor)
@@ -468,10 +601,18 @@ class ChatService:
     # ── Filtering (per store) ───────────────────────────────────────────
 
     def _passes_filters(self, event: dict[str, Any], wb_chat_id: str, store: dict[str, Any]) -> bool:
-        """Check if event passes the store's product whitelist filter."""
+        """Проверяет, проходит ли событие фильтр по белому списку товаров магазина.
+
+        Если у магазина задан product_whitelist (список nmID через запятую),
+        обрабатываются только чаты по указанным товарам. Если whitelist пуст —
+        обрабатываются все чаты.
+
+        Если whitelist задан, но nmID из события не удалось извлечь — чат
+        пропускается (безопаснее не отвечать, чем ответить на чужой товар).
+        """
         wl_str = store.get("product_whitelist", "")
         if not wl_str:
-            return True  # no filter = process all
+            return True  # нет фильтра = обрабатываем всё
 
         whitelist: set[int] = set()
         for part in wl_str.split(","):
@@ -502,7 +643,12 @@ class ChatService:
         store: dict[str, Any], wb: WBClient,
         sem: asyncio.Semaphore,
     ) -> None:
-        """Process a reserved chat with semaphore limiting."""
+        """Обрабатывает зарезервированный чат с ограничением параллельности через семафор.
+
+        Обёртка над _process_chat(), которая захватывает семафор магазина
+        перед началом обработки. Это гарантирует, что одновременно
+        обрабатывается не более 3 чатов на магазин (лимит WB API).
+        """
         async with sem:
             await self._process_chat(event, wb_chat_id, store, wb)
 
@@ -510,7 +656,18 @@ class ChatService:
         self, event: dict[str, Any], wb_chat_id: str,
         store: dict[str, Any], wb: WBClient,
     ) -> None:
-        """Process a single new chat for a store (already reserved in DB)."""
+        """Обработка одного нового чата для магазина (уже зарезервирован в БД).
+
+        Конвейер обработки:
+          1. Извлечение данных из события (nmID, имя клиента, текст, рейтинг)
+          2. Категоризация жалобы (categorize_complaint)
+          3. Задержка (config.new_chat_delay_seconds, обычно 5 сек) — ожидание
+             авто-сообщения WB об отзыве. WB создаёт чат и только через
+             несколько секунд добавляет системное сообщение с текстом отзыва.
+          4. Верификация: _is_review_chat проверяет, что чат действительно
+             вызван отзывом (а не обычным обращением клиента)
+          5. Отправка ответа (production) или логирование (dry-run)
+        """
         store_id = store["id"]
         user_chat_id = store["user_chat_id"]
 
@@ -541,8 +698,8 @@ class ChatService:
             store_id, wb_chat_id, client_name, nm_id, rating, complaint_category,
         )
 
-        # Quick check: if sender is "client" and message has no review keywords,
-        # this is likely a regular customer inquiry, not a review chat
+        # Быстрая проверка: если отправитель "client" и в сообщении нет ключевых слов
+        # об отзыве — скорее всего это обычное обращение, а не чат по отзыву
         sender = event.get("sender", "")
         event_text = (client_message or "").lower()
         if sender == "client":
@@ -553,16 +710,18 @@ class ChatService:
                     store_id, wb_chat_id,
                 )
 
-        # Wait for WB auto-message to arrive
+        # Задержка 5 секунд: WB создаёт чат мгновенно, но авто-сообщение
+        # с текстом отзыва добавляется через несколько секунд. Без этой паузы
+        # _is_review_chat не найдёт подтверждения и пропустит чат.
         await asyncio.sleep(self.config.new_chat_delay_seconds)
 
-        # Verify WB sent its auto-message about a review
+        # Верификация: проверяем, что WB отправил авто-сообщение об отзыве
         if not await self._is_review_chat(wb_chat_id, store, wb):
             logger.info(
                 "Store %d: chat %s skipped — not a review chat (no WB auto-message found)",
                 store_id, wb_chat_id,
             )
-            # Update status to skipped so we don't reprocess
+            # Помечаем как skipped, чтобы не обрабатывать повторно
             self.storage.save_chat(
                 chat_id=wb_chat_id, store_id=store_id,
                 status="skipped", **extra,
@@ -610,7 +769,16 @@ class ChatService:
         wb: WBClient,
         extra: dict[str, Any],
     ) -> None:
-        """Send message in production mode."""
+        """Отправляет сообщение продавца в чат WB в production-режиме.
+
+        Если replySign отсутствует в событии (бывает при некоторых типах чатов),
+        пробует получить его из списка чатов (get_chats_list). Без replySign
+        отправка невозможна — чат сохраняется со статусом "error".
+
+        При успешной отправке: статус "sent", уведомление пользователю.
+        При ошибке WB API или любой другой: статус "error", текст ошибки
+        сохраняется в БД, уведомление пользователю.
+        """
         store_id = store["id"]
         user_chat_id = store["user_chat_id"]
         store_name = store["store_name"]

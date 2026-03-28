@@ -104,12 +104,43 @@ TABLES = [
 
 
 class Storage:
+    """SQLite-хранилище данных для мульти-магазинного бота WB.
+
+    Управляет всеми данными приложения:
+      - stores: магазины (токены, настройки, режим работы)
+      - store_products: каталог товаров каждого магазина (nmID -> название)
+      - user_state: состояние Telegram-пользователя (онбординг, активный магазин)
+      - processed_chats: обработанные чаты (статус, текст, категория жалобы)
+      - key_value: курсоры опроса и прочие настройки
+      - notified_events: дедупликация уведомлений
+      - review_snapshots: снимки количества отзывов для мониторинга
+
+    Используется WAL-режим для параллельного чтения/записи из asyncio-корутин.
+    Одно соединение на весь процесс с check_same_thread=False.
+    """
+
     def __init__(self, db_path: str) -> None:
+        """Инициализация хранилища и создание/миграция таблиц.
+
+        Args:
+            db_path: Путь к файлу SQLite базы данных.
+
+        Настройки соединения:
+          - check_same_thread=False: позволяет использовать одно соединение
+            из разных asyncio-корутин (они выполняются в одном потоке, но
+            SQLite по умолчанию привязывает соединение к создавшему потоку).
+          - journal_mode=WAL: Write-Ahead Logging — позволяет читать данные
+            параллельно с записью без блокировок.
+          - busy_timeout=5000: ожидание до 5 секунд при блокировке БД другим
+            соединением (например, при одновременной записи из двух процессов).
+        """
         self._db_path = db_path
+        # check_same_thread=False необходим, т.к. asyncio-корутины могут
+        # обращаться к БД из разных задач (Tasks), хотя и в одном потоке
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA journal_mode=WAL")  # параллельное чтение/запись
+        self._conn.execute("PRAGMA busy_timeout=5000")  # 5 сек ожидание при блокировке
         self._init_tables()
         logger.info("Storage initialized: %s", db_path)
 
@@ -121,7 +152,7 @@ class Storage:
 
     def _migrate(self) -> None:
         """Run lightweight migrations for schema changes."""
-        # Add store_id to processed_chats if missing
+        # Добавляем store_id в processed_chats (миграция с однотенантной схемы)
         cols = {
             r[1]
             for r in self._conn.execute("PRAGMA table_info(processed_chats)").fetchall()
@@ -132,7 +163,7 @@ class Storage:
             )
             logger.info("Migration: added store_id to processed_chats")
 
-        # Add notification_group_id to stores if missing
+        # Добавляем поля для групповых уведомлений
         store_cols = {
             r[1]
             for r in self._conn.execute("PRAGMA table_info(stores)").fetchall()
@@ -160,6 +191,20 @@ class Storage:
         product_whitelist: str = "",
         app_mode: str = "dry-run",
     ) -> int:
+        """Создаёт новый магазин и возвращает его ID.
+
+        Args:
+            user_chat_id: Telegram chat_id владельца магазина.
+            store_name: Название магазина (уникально в рамках пользователя).
+            wb_api_token: API-токен WB для работы с чатами.
+            wb_content_token: Content API токен WB (для мониторинга отзывов).
+            message_text: Шаблон сообщения, отправляемого в чат.
+            product_whitelist: Список nmID через запятую (фильтр товаров).
+            app_mode: Режим работы — "dry-run" (тест) или "production".
+
+        Returns:
+            ID созданного магазина.
+        """
         now = datetime.now(timezone.utc).isoformat()
         with self._conn:
             cursor = self._conn.execute(
@@ -175,12 +220,14 @@ class Storage:
             return cursor.lastrowid  # type: ignore
 
     def get_store(self, store_id: int) -> dict[str, Any] | None:
+        """Возвращает магазин по ID или None, если не найден."""
         row = self._conn.execute(
             "SELECT * FROM stores WHERE id = ?", (store_id,)
         ).fetchone()
         return dict(row) if row else None
 
     def get_stores_for_user(self, user_chat_id: str) -> list[dict[str, Any]]:
+        """Возвращает все магазины пользователя, отсортированные по ID."""
         rows = self._conn.execute(
             "SELECT * FROM stores WHERE user_chat_id = ? ORDER BY id",
             (user_chat_id,),
@@ -188,12 +235,22 @@ class Storage:
         return [dict(r) for r in rows]
 
     def get_all_active_stores(self) -> list[dict[str, Any]]:
+        """Возвращает все активные магазины (is_active=1) из всех пользователей.
+
+        Используется в главном цикле опроса для обхода всех магазинов.
+        """
         rows = self._conn.execute(
             "SELECT * FROM stores WHERE is_active = 1"
         ).fetchall()
         return [dict(r) for r in rows]
 
     def update_store(self, store_id: int, **fields: Any) -> None:
+        """Обновляет произвольные поля магазина.
+
+        Args:
+            store_id: ID магазина.
+            **fields: Словарь {имя_поля: значение} для обновления.
+        """
         if not fields:
             return
         sets = ", ".join(f"{k} = ?" for k in fields)
@@ -202,6 +259,11 @@ class Storage:
             self._conn.execute(f"UPDATE stores SET {sets} WHERE id = ?", vals)
 
     def delete_store(self, store_id: int) -> None:
+        """Удаляет магазин и все связанные данные (товары, чаты, курсор).
+
+        Каскадное удаление: store_products, processed_chats, key_value (курсор),
+        и сама запись магазина.
+        """
         with self._conn:
             self._conn.execute("DELETE FROM store_products WHERE store_id = ?", (store_id,))
             self._conn.execute("DELETE FROM processed_chats WHERE store_id = ?", (store_id,))
@@ -209,6 +271,7 @@ class Storage:
             self._conn.execute("DELETE FROM stores WHERE id = ?", (store_id,))
 
     def count_stores_for_user(self, user_chat_id: str) -> int:
+        """Возвращает количество магазинов пользователя."""
         row = self._conn.execute(
             "SELECT COUNT(*) as cnt FROM stores WHERE user_chat_id = ?",
             (user_chat_id,),
@@ -218,6 +281,12 @@ class Storage:
     # ── Store Products ───────────────────────────────────────────
 
     def save_store_products(self, store_id: int, products: list[dict[str, Any]]) -> None:
+        """Сохраняет или обновляет каталог товаров магазина (upsert по store_id + nm_id).
+
+        Args:
+            store_id: ID магазина.
+            products: Список словарей с ключами "nm_id" и "name".
+        """
         now = datetime.now(timezone.utc).isoformat()
         with self._conn:
             for p in products:
@@ -232,6 +301,7 @@ class Storage:
                 )
 
     def get_store_products(self, store_id: int) -> list[dict[str, Any]]:
+        """Возвращает все товары магазина (nm_id, name), отсортированные по названию."""
         rows = self._conn.execute(
             "SELECT nm_id, name FROM store_products WHERE store_id = ? ORDER BY name",
             (store_id,),
@@ -239,6 +309,7 @@ class Storage:
         return [dict(r) for r in rows]
 
     def get_store_product_name(self, store_id: int, nm_id: int) -> str | None:
+        """Возвращает название товара по nmID или None, если товар не найден в каталоге."""
         row = self._conn.execute(
             "SELECT name FROM store_products WHERE store_id = ? AND nm_id = ?",
             (store_id, nm_id),
@@ -248,12 +319,18 @@ class Storage:
     # ── User State ───────────────────────────────────────────────
 
     def get_user_state(self, chat_id: str) -> dict[str, Any] | None:
+        """Возвращает состояние пользователя (онбординг, активный магазин) или None."""
         row = self._conn.execute(
             "SELECT * FROM user_state WHERE chat_id = ?", (chat_id,)
         ).fetchone()
         return dict(row) if row else None
 
     def set_user_state(self, chat_id: str, **fields: Any) -> None:
+        """Обновляет или создаёт состояние пользователя (upsert).
+
+        Если запись существует — обновляет указанные поля.
+        Если не существует — создаёт новую запись с указанными полями.
+        """
         existing = self.get_user_state(chat_id)
         if existing:
             if not fields:
@@ -282,6 +359,10 @@ class Storage:
     # ── Cursors (per store) ──────────────────────────────────────
 
     def get_cursor_for_store(self, store_id: int) -> int | None:
+        """Возвращает курсор опроса (timestamp в мс) для магазина или None при первом запуске.
+
+        Курсор хранится в таблице key_value с ключом "cursor:{store_id}".
+        """
         row = self._conn.execute(
             "SELECT value FROM key_value WHERE key = ?",
             (f"cursor:{store_id}",),
@@ -294,6 +375,7 @@ class Storage:
             return None
 
     def save_cursor_for_store(self, store_id: int, cursor: int) -> None:
+        """Сохраняет курсор опроса для магазина (upsert в key_value)."""
         now = datetime.now(timezone.utc).isoformat()
         key = f"cursor:{store_id}"
         with self._conn:
@@ -327,6 +409,7 @@ class Storage:
     # ── Notified Events ─────────────────────────────────────────
 
     def is_event_notified(self, event_id: str, store_id: int) -> bool:
+        """Проверяет, было ли уведомление по этому событию уже отправлено."""
         row = self._conn.execute(
             "SELECT 1 FROM notified_events WHERE event_id = ? AND store_id = ?",
             (event_id, store_id),
@@ -334,6 +417,7 @@ class Storage:
         return row is not None
 
     def mark_event_notified(self, event_id: str, store_id: int) -> None:
+        """Помечает событие как обработанное для дедупликации уведомлений."""
         now = datetime.now(timezone.utc).isoformat()
         try:
             with self._conn:
@@ -347,6 +431,7 @@ class Storage:
     # ── Processed Chats ──────────────────────────────────────────
 
     def is_chat_processed(self, chat_id: str, store_id: int) -> bool:
+        """Проверяет, был ли чат уже обработан (есть запись в processed_chats)."""
         row = self._conn.execute(
             "SELECT 1 FROM processed_chats WHERE chat_id = ? AND store_id = ?",
             (chat_id, store_id),
@@ -354,7 +439,17 @@ class Storage:
         return row is not None
 
     def reserve_chat(self, chat_id: str, store_id: int, **kwargs: Any) -> bool:
-        """Atomically reserve a chat for processing. Returns True if reserved, False if already exists."""
+        """Атомарно резервирует чат для обработки.
+
+        Вставляет запись со статусом 'pending'. Если запись уже существует
+        (UNIQUE constraint на store_id + chat_id), возвращает False.
+        Это предотвращает гонку при параллельной обработке одного и того же
+        чата из нескольких событий.
+
+        Returns:
+            True — чат зарезервирован, можно обрабатывать.
+            False — чат уже обрабатывается или обработан.
+        """
         now = datetime.now(timezone.utc).isoformat()
         try:
             with self._conn:
@@ -390,6 +485,15 @@ class Storage:
         complaint_category: str | None = None,
         rating: int | None = None,
     ) -> None:
+        """Сохраняет или обновляет запись обработанного чата (upsert).
+
+        При конфликте (store_id + chat_id уже существует) обновляет статус,
+        текст сообщения, ответ WB и ошибку. Для полей nm_id, product_name,
+        client_name, client_message, complaint_category и rating используется
+        COALESCE(excluded.field, field): новое значение берётся, только если
+        оно не NULL. Это сохраняет данные, записанные при reserve_chat(),
+        если при save_chat() они уже не доступны (например, при статусе "skipped").
+        """
         now = datetime.now(timezone.utc).isoformat()
         wb_resp_str = json.dumps(wb_response, ensure_ascii=False) if wb_response else None
         with self._conn:
@@ -407,6 +511,9 @@ class Storage:
                     wb_response = excluded.wb_response,
                     error_text = excluded.error_text,
                     processed_at = excluded.processed_at,
+                    -- COALESCE: сохраняем ранее записанные данные, если новое значение NULL.
+                    -- Это важно, т.к. reserve_chat() записывает nm_id/client_name/etc,
+                    -- а save_chat("skipped") может вызваться без этих данных.
                     nm_id = COALESCE(excluded.nm_id, nm_id),
                     product_name = COALESCE(excluded.product_name, product_name),
                     client_name = COALESCE(excluded.client_name, client_name),
@@ -421,7 +528,7 @@ class Storage:
             )
 
     def get_last_error(self, store_id: int) -> str | None:
-        """Get last error text for a store, or None."""
+        """Возвращает текст последней ошибки для магазина или None."""
         row = self._conn.execute(
             "SELECT error_text FROM processed_chats WHERE store_id = ? AND error_text IS NOT NULL "
             "ORDER BY processed_at DESC LIMIT 1",
@@ -432,6 +539,11 @@ class Storage:
     # ── Analytics ────────────────────────────────────────────────
 
     def get_stats(self, store_id: int) -> dict[str, int]:
+        """Возвращает статистику обработанных чатов магазина по статусам.
+
+        Returns:
+            Словарь {статус: количество, ..., "total": общее_количество}.
+        """
         rows = self._conn.execute(
             "SELECT status, COUNT(*) as cnt FROM processed_chats WHERE store_id = ? GROUP BY status",
             (store_id,),
@@ -441,6 +553,11 @@ class Storage:
         return stats
 
     def get_complaints_by_product(self, store_id: int) -> list[dict[str, Any]]:
+        """Возвращает топ-10 товаров по количеству жалоб с средним рейтингом.
+
+        Returns:
+            Список словарей {nm_id, product_name, cnt, avg_rating}.
+        """
         rows = self._conn.execute(
             """
             SELECT nm_id, product_name, COUNT(*) as cnt, AVG(rating) as avg_rating
@@ -453,6 +570,11 @@ class Storage:
         return [dict(r) for r in rows]
 
     def get_complaints_by_category(self, store_id: int) -> list[dict[str, Any]]:
+        """Возвращает распределение жалоб по категориям (complaint_category).
+
+        Returns:
+            Список словарей {complaint_category, cnt}, отсортированный по убыванию.
+        """
         rows = self._conn.execute(
             """
             SELECT complaint_category, COUNT(*) as cnt
@@ -465,6 +587,12 @@ class Storage:
         return [dict(r) for r in rows]
 
     def get_last_chats(self, store_id: int, limit: int = 5) -> list[dict[str, Any]]:
+        """Возвращает последние N обработанных чатов магазина (по убыванию ID).
+
+        Args:
+            store_id: ID магазина.
+            limit: Максимальное количество записей (по умолчанию 5).
+        """
         rows = self._conn.execute(
             """SELECT chat_id, status, sent_message_text, processed_at, error_text,
                       nm_id, product_name, client_name, client_message, complaint_category, rating
@@ -552,6 +680,11 @@ class Storage:
     def save_review_snapshot(
         self, store_id: int, nm_id: int, product_name: str, review_count: int,
     ) -> None:
+        """Сохраняет снимок количества отзывов для товара.
+
+        Каждый вызов создаёт новую запись (не upsert), что позволяет
+        отслеживать историю изменений количества отзывов.
+        """
         now = datetime.now(timezone.utc).isoformat()
         with self._conn:
             self._conn.execute(
@@ -563,7 +696,11 @@ class Storage:
     def get_previous_snapshot(
         self, store_id: int, nm_id: int,
     ) -> dict[str, Any] | None:
-        """Get the most recent snapshot before the current one."""
+        """Возвращает последний снимок отзывов для товара (для сравнения с текущим).
+
+        Используется ReviewMonitor для обнаружения новых отзывов:
+        если review_count вырос — значит появились новые отзывы.
+        """
         row = self._conn.execute(
             "SELECT review_count, snapshot_at FROM review_snapshots "
             "WHERE store_id = ? AND nm_id = ? "
@@ -575,8 +712,20 @@ class Storage:
         return None
 
     def get_all_latest_snapshots(self, store_id: int) -> list[dict[str, Any]]:
-        """Get the latest snapshot for each product in a store."""
+        """Возвращает последний снимок для каждого товара магазина.
+
+        Использует коррелированный подзапрос: для каждой строки rs1
+        находит MAX(snapshot_at) среди всех строк rs2 с тем же store_id
+        и nm_id. Это гарантирует выбор самой свежей записи для каждого
+        уникального товара, даже если снимков было несколько.
+
+        Индекс idx_review_snapshots_store_nm (store_id, nm_id, snapshot_at)
+        обеспечивает эффективность подзапроса.
+        """
         rows = self._conn.execute(
+            # Коррелированный подзапрос: для каждого товара (nm_id) выбираем
+            # строку, у которой snapshot_at совпадает с максимальным snapshot_at
+            # для этой пары (store_id, nm_id)
             """SELECT nm_id, product_name, review_count, snapshot_at
             FROM review_snapshots rs1
             WHERE store_id = ? AND snapshot_at = (
@@ -588,4 +737,5 @@ class Storage:
         return [dict(r) for r in rows]
 
     def close(self) -> None:
+        """Закрывает соединение с базой данных."""
         self._conn.close()

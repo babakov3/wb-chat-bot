@@ -31,7 +31,19 @@ BTN_ANALYTICS = "📈 Аналитика"
 
 
 def _build_keyboard(store: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Build reply keyboard with emergency stop."""
+    """Формирует клавиатуру нижнего меню Telegram (ReplyKeyboardMarkup).
+
+    Клавиатура фиксированная и содержит кнопки: Статус, СТОП, Настройки,
+    Аналитика, Магазины. Параметр ``store`` зарезервирован на будущее —
+    в перспективе кнопки могут меняться в зависимости от состояния магазина
+    (например, скрывать СТОП если магазин уже на паузе).
+
+    Args:
+        store: Словарь текущего магазина или None. Пока не влияет на набор кнопок.
+
+    Returns:
+        dict, пригодный для передачи в ``reply_markup`` Telegram API.
+    """
     return {
         "keyboard": [
             [{"text": BTN_STATUS}, {"text": BTN_STOP}],
@@ -50,7 +62,22 @@ def register_all(
     telegram: TelegramClient,
     wb_pool: WBClientPool,
 ) -> None:
-    """Register all commands, buttons, and handlers on the router."""
+    """Регистрирует все команды, кнопки и обработчики Telegram на маршрутизаторе.
+
+    Функция создаёт экземпляры SettingsUI и OnboardingWizard, определяет
+    внутренние обработчики (cmd_start, cmd_status и т.д.) и привязывает их
+    к соответствующим командам и кнопкам через ``router``.
+
+    Это единственная точка входа для подключения всей пользовательской
+    логики бота — вызывается один раз при старте приложения.
+
+    Args:
+        router: Маршрутизатор входящих сообщений Telegram.
+        service: Сервис обработки чатов (ChatService).
+        storage: Хранилище данных (SQLite).
+        telegram: Клиент Telegram Bot API.
+        wb_pool: Пул клиентов WB API (по одному на магазин).
+    """
 
     settings_ui = SettingsUI(storage, telegram, wb_pool)
     onboarding = OnboardingWizard(storage, telegram)
@@ -58,6 +85,13 @@ def register_all(
     # ── /start ────────────────────────────────────────────────────
 
     async def cmd_start(chat_id: str) -> None:
+        """Обработчик команды /start.
+
+        Если у пользователя нет магазинов — запускает мастер онбординга.
+        Если магазины есть — показывает приветственное сообщение с информацией
+        об активном магазине (режим, статус) и нижнюю клавиатуру.
+        При необходимости устанавливает первый магазин как активный.
+        """
         stores = storage.get_stores_for_user(chat_id)
         if not stores:
             await onboarding.start(chat_id)
@@ -89,6 +123,12 @@ def register_all(
     # ── Status ────────────────────────────────────────────────────
 
     async def cmd_status(chat_id: str) -> None:
+        """Обработчик кнопки «Статус» и команды /status.
+
+        Выводит подробную информацию об активном магазине:
+        режим работы, состояние токена, количество отслеживаемых товаров,
+        число обработанных чатов, дату последней обработки и последнюю ошибку.
+        """
         store = _get_active_store(chat_id)
         if not store:
             await telegram.send_message(chat_id, "Нет магазинов. Нажмите /start")
@@ -144,7 +184,11 @@ def register_all(
     # ── Emergency STOP ─────────────────────────────────────────────
 
     async def cmd_stop_all(chat_id: str) -> None:
-        """Emergency stop — deactivate ALL stores for this user."""
+        """Аварийная остановка — деактивирует ВСЕ магазины пользователя.
+
+        Перебирает все магазины пользователя и ставит is_active=0.
+        Бот прекращает отправку сообщений до повторной активации через настройки.
+        """
         stores = storage.get_stores_for_user(chat_id)
         if not stores:
             await telegram.send_message(chat_id, "Нет магазинов.")
@@ -165,6 +209,12 @@ def register_all(
     # ── Analytics ─────────────────────────────────────────────────
 
     async def cmd_analytics(chat_id: str) -> None:
+        """Обработчик кнопки «Аналитика» и команды /analytics.
+
+        Показывает статистику обработанных чатов активного магазина:
+        общее количество, разбивку по статусам (отправлено / тест / ошибки),
+        а также топ жалоб по категориям и товарам.
+        """
         store = _get_active_store(chat_id)
         if not store:
             await telegram.send_message(chat_id, "Нет магазинов. Нажмите /start")
@@ -219,6 +269,10 @@ def register_all(
     # ── Settings ──────────────────────────────────────────────────
 
     async def cmd_settings(chat_id: str) -> None:
+        """Обработчик кнопки «Настройки» и команды /settings.
+
+        Открывает inline-меню настроек активного магазина через SettingsUI.
+        """
         store = _get_active_store(chat_id)
         if not store:
             await telegram.send_message(chat_id, "Нет магазинов. Нажмите /start")
@@ -228,6 +282,12 @@ def register_all(
     # ── Stores ────────────────────────────────────────────────────
 
     async def cmd_stores(chat_id: str) -> None:
+        """Обработчик кнопки «Магазины».
+
+        Показывает список всех магазинов пользователя с указанием активного,
+        режима работы и статуса. Предлагает кнопки переключения между магазинами
+        и добавления нового.
+        """
         stores = storage.get_stores_for_user(chat_id)
         active_id = storage.get_active_store_id(chat_id)
 
@@ -257,15 +317,32 @@ def register_all(
     # ── Callback router ──────────────────────────────────────────
 
     async def on_callback(chat_id: str, data: str, message_id: int) -> None:
-        """Route callbacks by prefix."""
+        """Маршрутизатор callback-запросов от inline-кнопок.
+
+        Все callback_data имеют префикс, определяющий подсистему-обработчик:
+          - ``s:``   — настройки магазина (SettingsUI)
+          - ``st:``  — переключение/добавление магазинов (SettingsUI + онбординг)
+          - ``ob:``  — мастер онбординга (OnboardingWizard)
+          - ``grp:`` — привязка группы к магазину (grp:link:<store_id>:<group_id>)
+
+        Args:
+            chat_id: Идентификатор чата Telegram.
+            data: Строка callback_data из нажатой кнопки.
+            message_id: ID сообщения, содержащего inline-клавиатуру.
+        """
+        # Префиксы s: и st: обрабатываются SettingsUI
         if data.startswith("s:") or data.startswith("st:"):
             if data == "st:add":
+                # Специальный случай: добавление нового магазина — запуск онбординга
                 await onboarding.start(chat_id)
                 return
             await settings_ui.handle_callback(chat_id, data, message_id)
         elif data.startswith("ob:"):
+            # Префикс ob: — шаги мастера онбординга
             await onboarding.handle_callback(chat_id, data, message_id)
         elif data.startswith("grp:link:"):
+            # Префикс grp:link: — привязка Telegram-группы к магазину
+            # Формат: grp:link:<store_id>:<group_id>
             # grp:link:<store_id>:<group_id>
             parts = data.split(":")
             if len(parts) >= 4:
@@ -283,7 +360,15 @@ def register_all(
     # ── Text input router ────────────────────────────────────────
 
     async def on_text_input(chat_id: str, text: str, message_id: int) -> None:
-        """Route text input based on input_waiting prefix."""
+        """Маршрутизатор текстового ввода пользователя.
+
+        Когда бот ожидает свободный текст (например, название магазина или токен),
+        в user_state сохраняется поле ``input_waiting`` с префиксом подсистемы:
+          - ``ob:`` — текст обрабатывается OnboardingWizard
+          - ``s:``  — текст обрабатывается SettingsUI
+
+        Если ``input_waiting`` не задан — ввод игнорируется.
+        """
         user_state = storage.get_user_state(chat_id)
         if not user_state:
             return
@@ -297,6 +382,17 @@ def register_all(
     # ── Helper ────────────────────────────────────────────────────
 
     def _get_active_store(chat_id: str) -> dict[str, Any] | None:
+        """Возвращает активный магазин пользователя.
+
+        Если active_store_id не задан, но магазины есть — автоматически
+        назначает первый магазин активным. Если магазинов нет — возвращает None.
+
+        Args:
+            chat_id: Идентификатор чата Telegram.
+
+        Returns:
+            Словарь магазина из БД или None.
+        """
         store_id = storage.get_active_store_id(chat_id)
         if store_id is None:
             stores = storage.get_stores_for_user(chat_id)
@@ -310,7 +406,12 @@ def register_all(
     # ── /connect — link group to store ─────────────────────────────
 
     async def cmd_connect(chat_id: str) -> None:
-        """Link a Telegram group (and topic) to ALL stores at once."""
+        """Привязывает Telegram-группу (и топик) ко ВСЕМ магазинам.
+
+        Команда /connect вызывается из групповго чата. Сохраняет group_id
+        и thread_id (если бот находится в топике форума) для каждого магазина
+        в БД, чтобы уведомления приходили в эту группу/топик.
+        """
         group_id = chat_id
         thread_id = getattr(router, '_last_thread_id', None)
 
@@ -342,7 +443,12 @@ def register_all(
         )
 
     async def cmd_disconnect(chat_id: str) -> None:
-        """Unlink group from store."""
+        """Отвязывает текущую группу от всех магазинов.
+
+        Команда /disconnect ищет все магазины, привязанные к данной группе,
+        и очищает поле notification_group_id. После этого уведомления
+        перестанут приходить в группу.
+        """
         stores = storage._conn.execute(
             "SELECT id, store_name FROM stores WHERE notification_group_id = ?",
             (chat_id,),

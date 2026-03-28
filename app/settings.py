@@ -1,8 +1,11 @@
-"""Per-store settings UI via Telegram inline keyboards.
+"""Inline-интерфейс настроек магазина через Telegram-клавиатуры.
 
-Reads/writes to the stores table through Storage.
-Shows settings for the user's active store (from user_state.active_store_id).
-Callback prefix: s: for settings, st: for store switching.
+Читает и записывает данные в таблицу stores через Storage.
+Показывает настройки активного магазина пользователя (из user_state.active_store_id).
+
+Соглашение о префиксах callback_data:
+  - ``s:``  — действия внутри настроек (переключение режима, товары, шаблоны и т.д.)
+  - ``st:`` — переключение между магазинами и добавление нового
 """
 
 from __future__ import annotations
@@ -27,9 +30,13 @@ def _kb(rows: list[list[tuple[str, str]]]) -> dict[str, Any]:
     }
 
 
-# ── Message templates ────────────────────────────────────────────────
-
-# {contact} will be replaced with the user's actual contact when applying
+# ── Шаблоны сообщений ────────────────────────────────────────────────
+# Готовые шаблоны ответов клиентам с негативными отзывами.
+# Плейсхолдер {contact} при применении заменяется на контакт пользователя
+# (например, @my_support или ссылку на Telegram/WhatsApp).
+# Каждый шаблон содержит:
+#   - name: короткое название для отображения в меню
+#   - text: полный текст сообщения с {contact} плейсхолдером
 TEMPLATES = [
     {
         "name": "Компенсация + контакт",
@@ -68,7 +75,17 @@ TEMPLATES = [
 
 
 def _parse_int_set(raw: str) -> set[int]:
-    """Parse comma-separated integers."""
+    """Разбирает строку с целыми числами через запятую в множество int.
+
+    Используется для десериализации product_whitelist из БД.
+    Некорректные значения (не числа) молча пропускаются.
+
+    Args:
+        raw: Строка вида "123,456,789".
+
+    Returns:
+        Множество целых чисел, например {123, 456, 789}.
+    """
     result: set[int] = set()
     for part in raw.split(","):
         part = part.strip()
@@ -81,6 +98,16 @@ def _parse_int_set(raw: str) -> set[int]:
 
 
 def _int_set_to_str(s: set[int]) -> str:
+    """Сериализует множество int обратно в строку через запятую.
+
+    Обратная операция к _parse_int_set. Числа сортируются для стабильного вывода.
+
+    Args:
+        s: Множество целых чисел.
+
+    Returns:
+        Строка вида "123,456,789" или пустая строка, если множество пустое.
+    """
     return ",".join(str(x) for x in sorted(s)) if s else ""
 
 
@@ -93,6 +120,13 @@ class SettingsUI:
         telegram: TelegramClient,
         wb_pool: WBClientPool,
     ) -> None:
+        """Инициализация UI настроек.
+
+        Args:
+            storage: Хранилище данных (SQLite) для чтения/записи настроек магазина.
+            telegram: Клиент Telegram Bot API для отправки и редактирования сообщений.
+            wb_pool: Пул WB-клиентов — используется для сброса клиента при смене токена.
+        """
         self._storage = storage
         self._tg = telegram
         self._wb_pool = wb_pool
@@ -116,7 +150,11 @@ class SettingsUI:
     # ── Settings main entry ─────────────────────────────────────
 
     async def show_settings(self, chat_id: str) -> None:
-        """Entry point: show settings for active store."""
+        """Точка входа: отправляет главное меню настроек активного магазина.
+
+        Создаёт новое сообщение с inline-клавиатурой и сохраняет его ID
+        в user_state для последующего редактирования.
+        """
         store = self._get_active_store(chat_id)
         if not store:
             await self._tg.send_message(chat_id, "Нет активного магазина. Добавьте через /start")
@@ -129,7 +167,12 @@ class SettingsUI:
     # ── Callback dispatcher ─────────────────────────────────────
 
     async def handle_callback(self, chat_id: str, data: str, message_id: int) -> None:
-        """Handle all s: and st: callbacks."""
+        """Диспетчер всех callback-запросов с префиксами ``s:`` и ``st:``.
+
+        Разбирает callback_data и вызывает соответствующий метод:
+        переключение магазина, смена режима, управление товарами,
+        шаблонами сообщений, токеном, переименование и удаление.
+        """
         parts = data.split(":")
 
         # ── Store switching (st:) ────────────────────────────────
@@ -214,7 +257,15 @@ class SettingsUI:
     # ── Text input dispatcher ───────────────────────────────────
 
     async def handle_text_input(self, chat_id: str, text: str) -> None:
-        """Handle text input for settings edits."""
+        """Обрабатывает текстовый ввод для настроек.
+
+        Вызывается когда пользователь отправляет текст, а в user_state
+        стоит input_waiting с префиксом ``s:``. Поддерживает:
+          - ``s:rename``      — переименование магазина
+          - ``s:token``       — обновление API-токена (с валидацией)
+          - ``s:msg_text``    — ввод произвольного текста сообщения
+          - ``s:tpl_contact`` — ввод контакта для шаблона с {contact}
+        """
         user_state = self._storage.get_user_state(chat_id)
         if not user_state:
             return
@@ -298,6 +349,17 @@ class SettingsUI:
     # ── Main menu ────────────────────────────────────────────────
 
     def _main_menu(self, store: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Формирует текст и inline-клавиатуру главного меню настроек.
+
+        Отображает: режим работы, количество отслеживаемых товаров, тип сообщения.
+        Кнопки: переключение режима, сообщение, товары, токен, переименование, удаление.
+
+        Args:
+            store: Словарь магазина из БД.
+
+        Returns:
+            Кортеж (текст сообщения, inline_keyboard markup).
+        """
         mode_label = "БОЕВОЙ" if store["app_mode"] == "production" else "ТЕСТ"
         mode_icon = "🟢" if store["app_mode"] == "production" else "🟡"
         wl = store.get("product_whitelist", "")
@@ -341,6 +403,10 @@ class SettingsUI:
         return text, markup
 
     async def _show_main(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Редактирует существующее сообщение, показывая главное меню настроек.
+
+        Сбрасывает input_waiting, чтобы бот не ожидал текстового ввода.
+        """
         self._storage.set_user_state(chat_id, input_waiting=None)
         text, markup = self._main_menu(store)
         await self._tg.edit_message_text(chat_id, message_id, text, reply_markup=markup)
@@ -348,6 +414,11 @@ class SettingsUI:
     # ── Token update ────────────────────────────────────────────
 
     async def _prompt_token_update(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Запрашивает у пользователя новый WB API токен.
+
+        Устанавливает input_waiting="s:token" и показывает инструкцию.
+        Сам токен обрабатывается в handle_text_input.
+        """
         self._storage.set_user_state(chat_id, input_waiting="s:token")
         await self._tg.edit_message_text(
             chat_id, message_id,
@@ -360,6 +431,10 @@ class SettingsUI:
     # ── Mode toggle ──────────────────────────────────────────────
 
     async def _toggle_mode(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Переключает режим магазина между ТЕСТ (dry-run) и БОЕВОЙ (production).
+
+        После переключения обновляет главное меню настроек.
+        """
         new_mode = "production" if store["app_mode"] == "dry-run" else "dry-run"
         self._storage.update_store(store["id"], app_mode=new_mode)
         logger.info("Store %d mode changed to %s", store["id"], new_mode)
@@ -369,6 +444,11 @@ class SettingsUI:
     # ── Message submenu ──────────────────────────────────────────
 
     async def _show_message_menu(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Показывает подменю управления сообщением для клиентов.
+
+        Отображает превью текущего сообщения и кнопки: посмотреть полностью,
+        изменить текст, выбрать шаблон.
+        """
         self._storage.set_user_state(chat_id, input_waiting=None)
         msg = store["message_text"]
         preview = msg[:200] + "..." if len(msg) > 200 else msg
@@ -387,6 +467,7 @@ class SettingsUI:
         await self._tg.edit_message_text(chat_id, message_id, text, reply_markup=markup)
 
     async def _show_message_full(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Показывает полный текст текущего сообщения (до 3500 символов)."""
         msg = store["message_text"]
         text = f"<b>Текущее сообщение:</b>\n\n{msg[:3500]}"
         markup = _kb([
@@ -396,6 +477,10 @@ class SettingsUI:
         await self._tg.edit_message_text(chat_id, message_id, text, reply_markup=markup)
 
     async def _prompt_message_edit(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Запрашивает у пользователя новый текст сообщения.
+
+        Устанавливает input_waiting="s:msg_text". Текст обрабатывается в handle_text_input.
+        """
         self._storage.set_user_state(
             chat_id, input_waiting="s:msg_text", menu_message_id=message_id
         )
@@ -408,6 +493,7 @@ class SettingsUI:
         await self._tg.edit_message_text(chat_id, message_id, text, reply_markup=markup)
 
     async def _show_templates(self, chat_id: str, message_id: int) -> None:
+        """Показывает список доступных шаблонов сообщений для выбора."""
         text = (
             "<b>Готовые шаблоны</b>\n\n"
             "Выберите шаблон для просмотра.\n"
@@ -421,7 +507,10 @@ class SettingsUI:
         await self._tg.edit_message_text(chat_id, message_id, text, reply_markup=markup)
 
     async def _preview_template(self, chat_id: str, idx: int, message_id: int) -> None:
-        """Show full template text, then offer [Use this / Back]."""
+        """Показывает полный текст выбранного шаблона с кнопками «Использовать» / «Назад».
+
+        Сохраняет индекс шаблона в onboarding_data для последующего применения.
+        """
         if idx < 0 or idx >= len(TEMPLATES):
             return
         tpl = TEMPLATES[idx]
@@ -443,7 +532,11 @@ class SettingsUI:
         await self._tg.edit_message_text(chat_id, message_id, text, reply_markup=markup)
 
     async def _apply_previewed_template(self, chat_id: str, message_id: int) -> None:
-        """Apply the previously previewed template."""
+        """Применяет ранее просмотренный шаблон к магазину.
+
+        Если шаблон содержит плейсхолдер {contact} — запрашивает контакт
+        у пользователя. Иначе — сохраняет текст шаблона как message_text магазина.
+        """
         import json
         user_state = self._storage.get_user_state(chat_id)
         if not user_state:
@@ -487,6 +580,12 @@ class SettingsUI:
     # ── Products ─────────────────────────────────────────────────
 
     async def _show_products(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Показывает экран управления товарами с чекбоксами.
+
+        Если whitelist пуст — отслеживаются все товары. Пользователь может
+        включать/выключать конкретные товары или выбрать/снять все.
+        Отображается до 15 товаров (ограничение Telegram на кнопки).
+        """
         store_id = store["id"]
         wl = _parse_int_set(store.get("product_whitelist", ""))
         products = self._storage.get_store_products(store_id)
@@ -543,6 +642,7 @@ class SettingsUI:
     # ── Rename store ─────────────────────────────────────────────
 
     async def _prompt_rename(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Запрашивает новое название магазина. Устанавливает input_waiting="s:rename"."""
         self._storage.set_user_state(
             chat_id, input_waiting="s:rename", menu_message_id=message_id
         )
@@ -556,6 +656,7 @@ class SettingsUI:
     # ── Delete store ────────────────────────────────────────────
 
     async def _confirm_delete(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Показывает подтверждение удаления магазина с предупреждением о необратимости."""
         text = (
             f"⚠️ <b>Удалить магазин «{store['store_name']}»?</b>\n\n"
             "Все настройки, товары и история обработки будут удалены.\n"
@@ -568,6 +669,11 @@ class SettingsUI:
         await self._tg.edit_message_text(chat_id, message_id, text, reply_markup=markup)
 
     async def _delete_store(self, chat_id: str, store: dict[str, Any], message_id: int) -> None:
+        """Удаляет магазин из БД и переключает на следующий (если есть).
+
+        Если других магазинов не осталось — сбрасывает active_store_id
+        и предлагает добавить новый через /start.
+        """
         store_name = store["store_name"]
         store_id = store["id"]
         self._storage.delete_store(store_id)
@@ -594,6 +700,7 @@ class SettingsUI:
     async def _select_all_products(
         self, chat_id: str, store: dict[str, Any], message_id: int
     ) -> None:
+        """Добавляет все товары магазина в whitelist (выборочное отслеживание всех)."""
         products = self._storage.get_store_products(store["id"])
         all_nms = {p["nm_id"] for p in products}
         self._storage.update_store(store["id"], product_whitelist=_int_set_to_str(all_nms))
@@ -603,6 +710,7 @@ class SettingsUI:
     async def _deselect_all_products(
         self, chat_id: str, store: dict[str, Any], message_id: int
     ) -> None:
+        """Очищает whitelist — бот будет отслеживать все товары без ограничений."""
         self._storage.update_store(store["id"], product_whitelist="")
         store = self._storage.get_store(store["id"])
         await self._show_products(chat_id, store, message_id)
@@ -610,6 +718,7 @@ class SettingsUI:
     async def _toggle_product_in_whitelist(
         self, chat_id: str, store: dict[str, Any], nm_id: int, message_id: int
     ) -> None:
+        """Переключает товар в whitelist: добавляет если нет, убирает если есть."""
         wl = _parse_int_set(store.get("product_whitelist", ""))
         if nm_id in wl:
             wl.discard(nm_id)
@@ -622,6 +731,7 @@ class SettingsUI:
     # ── Store switching ──────────────────────────────────────────
 
     async def _show_store_list(self, chat_id: str, message_id: int) -> None:
+        """Показывает список магазинов с кнопками переключения и добавления."""
         stores = self._storage.get_stores_for_user(chat_id)
         active_id = self._storage.get_active_store_id(chat_id)
 
